@@ -1,0 +1,52 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: whats-cloud-mcp/gateway:latest
+    container_name: whats-cloud-gateway
+    restart: unless-stopped
+    ports:
+      # Published on the host's loopback only. Put a TLS-terminating reverse
+      # proxy in front of this before exposing it to the internet; the MCP
+      # endpoint carries a bearer token on every request.
+      - "127.0.0.1:${HOST_PORT:-8080}:8080"
+    environment:
+      # Required. Guards the admin credential class.
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?ADMIN_TOKEN must be set}
+      DB_PATH: /data/whats-cloud.db
+      MEDIA_DIR: /data/media
+      # 0.0.0.0 INSIDE the container is deliberate and is not the same thing as
+      # binding 0.0.0.0 on the host. A container process that binds 127.0.0.1
+      # is reachable only from inside its own network namespace, so Docker
+      # could never forward the published port to it. The container's network
+      # namespace is the isolation boundary here; the `ports` mapping above is
+      # what decides who can actually reach the gateway.
+      BIND_ADDR: 0.0.0.0:8080
+      # Comma-separated browser origins allowed on /mcp. Empty rejects every
+      # browser origin; non-browser MCP clients send no Origin and are allowed.
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      # One volume holds both the SQLite file and the media directory.
+      - whats-cloud-data:/data
+    # A small shared server: keep the gateway from eating the box.
+    mem_limit: 256m
+    mem_reservation: 64m
+    cpus: 1.0
+    healthcheck:
+      # The distroless image has no shell and no curl, so the binary probes its
+      # own health endpoint.
+      test: ["CMD", "/app/gateway", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whats-cloud-data:
