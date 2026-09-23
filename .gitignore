@@ -1,0 +1,32 @@
+# Binaries (root-anchored: cmd/gateway and cmd/mcp are source directories)
+/bin/
+/dist/
+/gateway
+/mcp
+*.exe
+*.test
+
+# Go
+*.out
+coverage.out
+vendor/
+
+# Runtime data: the SQLite database, its WAL sidecars and downloaded media
+/data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+media/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
