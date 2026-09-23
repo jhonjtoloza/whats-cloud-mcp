@@ -1,0 +1,41 @@
+# The builder stage does `COPY . .`, so anything listed here never reaches any
+# layer at all — not the final image, and not the build cache CI pushes to
+# ghcr.io either.
+
+# Secrets. .env is git-ignored; keep it out of the build context too.
+.env
+.env.*
+!env.example
+
+# Runtime data: the SQLite database, its WAL sidecars and downloaded media.
+# These live in the mounted volume, never in the image.
+/data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+media/
+
+# Build artefacts from a host build — the image builds its own.
+/bin/
+/dist/
+/gateway
+*.exe
+*.test
+coverage.out
+
+# Not needed to compile, and .git in particular is large and churns the cache.
+.git/
+.github/
+.gitignore
+.dockerignore
+Makefile
+README.md
+docker-compose*.yml
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

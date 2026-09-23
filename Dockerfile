@@ -2,7 +2,13 @@
 
 # ---- builder -----------------------------------------------------------------
 # whatsmeow currently requires Go >= 1.26.0; see README for details.
-FROM golang:1.26-alpine AS builder
+#
+# --platform=$BUILDPLATFORM pins this stage to the machine doing the building,
+# NOT to the image being produced. Do not "simplify" it away: without it buildx
+# runs the whole arm64 builder stage under QEMU emulation, and a Go build that
+# takes seconds natively takes many minutes emulated. Go cross-compiles for free,
+# so we build natively and just retarget it with GOOS/GOARCH below.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
 WORKDIR /src
 
@@ -12,11 +18,17 @@ RUN go mod download
 
 COPY . .
 
+# Supplied automatically by buildx, one value per entry in --platform.
+ARG TARGETOS
+ARG TARGETARCH
+
 # CGO_ENABLED=0 is not optional: the SQLite driver is pure Go
 # (modernc.org/sqlite), which is what lets the binary run on a distroless
-# static image with no libc at all.
-ENV CGO_ENABLED=0 GOOS=linux
-RUN go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway
+# static image with no libc at all. It is also what makes the cross-compile
+# above a plain GOARCH switch rather than a cross-toolchain problem.
+ENV CGO_ENABLED=0
+RUN GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway
 
 # ---- runtime -----------------------------------------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot
