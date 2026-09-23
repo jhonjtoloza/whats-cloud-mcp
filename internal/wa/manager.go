@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +26,14 @@ import (
 const qrWaitTimeout = 20 * time.Second
 
 // pairClientDisplayName is what the user sees in WhatsApp's linked-devices list.
-const pairClientDisplayName = "whats-cloud-mcp"
+//
+// It MUST be formatted as "Browser (OS)" and match a browser and OS WhatsApp
+// recognises: the server validates this field and rejects anything else with
+// "info query returned status 400: bad-request". A product name such as
+// "whats-cloud-mcp" fails pairing outright, so this is not a label we are free
+// to brand. Keep it consistent with the PairClient* constant passed alongside
+// it.
+const pairClientDisplayName = "Chrome (Linux)"
 
 // Manager is the whatsmeow-backed SessionManager. It holds one whatsmeow
 // client per tenant, guarded by a mutex.
@@ -428,13 +436,32 @@ func extractText(msg *waProto.Message) string {
 	return ""
 }
 
-// parseJID accepts both a bare user id and a full JID.
+// notDigits matches everything that cannot appear in a bare phone number.
+var notDigits = regexp.MustCompile(`\D`)
+
+// parseJID accepts both a bare phone number and a full JID.
+//
+// A bare number is user input: it reaches us from web forms and chat messages
+// carrying "+", spaces and dashes, so it is reduced to digits before the
+// default user server is appended. whatsmeow's own PairPhone normalises the
+// same way, and sending had no business being stricter than pairing.
+//
+// A full JID is an address, not user input, and is passed through untouched.
+// The user part of a group JID legitimately contains a dash
+// ("123456789-987654@g.us"), so stripping non-digits there would corrupt a
+// valid address.
 func parseJID(raw string) (types.JID, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return types.JID{}, ErrInvalidJID
 	}
 	if !strings.ContainsRune(raw, '@') {
+		raw = notDigits.ReplaceAllString(raw, "")
+		// types.ParseJID accepts any user part, so a string that held no
+		// digits at all would otherwise become a valid-looking recipient.
+		if raw == "" {
+			return types.JID{}, ErrInvalidJID
+		}
 		raw += "@" + types.DefaultUserServer
 	}
 
