@@ -16,6 +16,16 @@ const (
 	CodeConflict       = "conflict"
 	CodeInternal       = "internal_error"
 	CodeUnavailable    = "unavailable"
+	// CodeGone means the thing existed and no longer does. It is deliberately
+	// distinct from CodeUnavailable, which invites a retry: WhatsApp expires
+	// media server-side, and a caller told to retry a file that is gone for
+	// good would keep asking forever.
+	CodeGone = "gone"
+	// CodeTooLarge means the request would move more bytes than the gateway
+	// is configured to handle.
+	CodeTooLarge = "too_large"
+	// CodeUnsupportedType means the gateway does not handle that media type.
+	CodeUnsupportedType = "unsupported_media_type"
 )
 
 // Body is the wire representation of an error response.

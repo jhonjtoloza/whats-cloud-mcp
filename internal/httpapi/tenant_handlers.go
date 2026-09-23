@@ -152,8 +152,8 @@ func (s *Server) handleListChats(w http.ResponseWriter, r *http.Request) {
 }
 
 type listMessagesResponse struct {
-	ChatJID  string          `json:"chat_jid"`
-	Messages []store.Message `json:"messages"`
+	ChatJID  string        `json:"chat_jid"`
+	Messages []messageView `json:"messages"`
 }
 
 // handleListChatMessages returns a chat's history, newest first, always scoped
@@ -180,11 +180,7 @@ func (s *Server) handleListChatMessages(w http.ResponseWriter, r *http.Request) 
 		apierr.Internal(w)
 		return
 	}
-	if messages == nil {
-		messages = []store.Message{}
-	}
-
-	writeJSON(w, http.StatusOK, listMessagesResponse{ChatJID: chatJID, Messages: messages})
+	writeJSON(w, http.StatusOK, listMessagesResponse{ChatJID: chatJID, Messages: messageViews(messages)})
 }
 
 type syncHistoryRequest struct {

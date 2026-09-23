@@ -130,4 +130,17 @@ type SessionManager interface {
 	// It returns ErrNoAnchorMessage when the chat has nothing stored to anchor
 	// the request on.
 	SyncHistory(ctx context.Context, tenantID, chatJID string, count int) (SyncResult, error)
+	// FetchMedia downloads the attachment of one message, on demand.
+	//
+	// Media is never downloaded in advance — not on receipt, not on history
+	// sync, not in a background job — because eagerly storing every image,
+	// video and sticker would fill a small shared server with bytes nobody
+	// reads. A message row keeps the reference; this is the only thing that
+	// turns one into a file.
+	//
+	// It is idempotent: media already on disk is returned untouched. The
+	// tradeoff of storing a reference is that WhatsApp expires media
+	// server-side, so it returns ErrMediaUnavailable for an attachment that is
+	// gone, and never retries one.
+	FetchMedia(ctx context.Context, tenantID, messageID string) (MediaRef, error)
 }

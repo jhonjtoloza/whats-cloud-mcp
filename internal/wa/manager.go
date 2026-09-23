@@ -52,6 +52,7 @@ type Manager struct {
 	historyScope   config.HistorySyncScope
 	historyTimeout time.Duration
 	pending        *pendingHistory
+	media          *mediaFetcher
 
 	mu      sync.RWMutex
 	clients map[string]*whatsmeow.Client
@@ -66,6 +67,13 @@ type ManagerOptions struct {
 	HistoryScope config.HistorySyncScope
 	// HistoryTimeout bounds how long SyncHistory waits for the phone.
 	HistoryTimeout time.Duration
+	// MediaDir is the root of the media tree. Each tenant gets a subdirectory.
+	MediaDir string
+	// MediaMaxBytes refuses attachments above this size.
+	MediaMaxBytes int64
+	// MediaFetchTypes are the media types FetchMedia may download. References
+	// are stored for every type regardless; this only gates the bytes.
+	MediaFetchTypes []string
 }
 
 // NewManager builds a Manager on top of the gateway's own database handle, so
@@ -80,6 +88,15 @@ func NewManager(ctx context.Context, db *store.DB, logger *slog.Logger, opts Man
 	if opts.HistoryTimeout <= 0 {
 		opts.HistoryTimeout = config.DefaultHistorySyncTimeout
 	}
+	if opts.MediaDir == "" {
+		opts.MediaDir = config.DefaultMediaDir
+	}
+	if opts.MediaMaxBytes <= 0 {
+		opts.MediaMaxBytes = config.DefaultMediaMaxBytes
+	}
+	if len(opts.MediaFetchTypes) == 0 {
+		opts.MediaFetchTypes = config.DefaultMediaFetchTypes()
+	}
 
 	// dbutil recognises any dialect starting with "sqlite"; the driver itself
 	// is the pure-Go modernc.org/sqlite registered as "sqlite".
@@ -88,7 +105,7 @@ func NewManager(ctx context.Context, db *store.DB, logger *slog.Logger, opts Man
 		return nil, fmt.Errorf("wa: upgrade whatsmeow schema: %w", err)
 	}
 
-	return &Manager{
+	manager := &Manager{
 		container:      container,
 		sessions:       db.Sessions(),
 		messages:       db.Messages(),
@@ -98,7 +115,16 @@ func NewManager(ctx context.Context, db *store.DB, logger *slog.Logger, opts Man
 		historyTimeout: opts.HistoryTimeout,
 		pending:        newPendingHistory(),
 		clients:        make(map[string]*whatsmeow.Client),
-	}, nil
+	}
+	manager.media = &mediaFetcher{
+		messages:      db.Messages(),
+		dir:           opts.MediaDir,
+		maxBytes:      opts.MediaMaxBytes,
+		allowed:       allowedMediaTypes(opts.MediaFetchTypes),
+		logger:        logger,
+		downloaderFor: manager.downloaderFor,
+	}
+	return manager, nil
 }
 
 // RestoreSessions reconnects every tenant that is already paired. Call it once
@@ -421,6 +447,14 @@ func (m *Manager) persistInbound(ctx context.Context, tenantID string, e *events
 		Timestamp:   e.Info.Timestamp.UTC(),
 		CreatedAt:   time.Now().UTC(),
 	}
+	// Store the reference the attachment could later be fetched with, and
+	// nothing else: no image, video or voice note is downloaded on receipt.
+	// whatsmeow has already unwrapped the live message, but mediaReference is
+	// used all the same so the live and history paths cannot disagree about
+	// what a message carries.
+	applyMediaReference(&record, mediaReference(e.Message))
+	// whatsmeow's own naming on the live info wins when it has one: it is the
+	// value historyMediaType was written to mirror.
 	if e.Info.MediaType != "" {
 		mediaType := e.Info.MediaType
 		record.MediaType = &mediaType

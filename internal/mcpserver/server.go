@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -38,14 +39,34 @@ type Chat struct {
 
 // Message is the tool-facing view of a single message.
 type Message struct {
-	ID          string `json:"id" jsonschema:"the gateway's internal message id"`
+	ID          string `json:"id" jsonschema:"the gateway's internal message id; pass it to get_media to download an attachment"`
 	ChatJID     string `json:"chat_jid" jsonschema:"the conversation this message belongs to"`
 	SenderJID   string `json:"sender_jid" jsonschema:"who sent the message"`
 	WAMessageID string `json:"wa_message_id" jsonschema:"the WhatsApp message id"`
 	Direction   string `json:"direction" jsonschema:"in for received, out for sent"`
 	Body        string `json:"body" jsonschema:"the text content"`
-	MediaType   string `json:"media_type,omitempty" jsonschema:"media type when the message carried an attachment"`
-	Timestamp   string `json:"timestamp" jsonschema:"RFC 3339 timestamp of the message"`
+	MediaType   string `json:"media_type,omitempty" jsonschema:"media type when the message carried an attachment: image, video, ptt (a voice note), audio, document, sticker, gif, vcard or location"`
+	MimeType    string `json:"mime_type,omitempty" jsonschema:"the declared content type of the attachment"`
+	MediaStatus string `json:"media_status,omitempty" jsonschema:"empty when nobody has asked for the attachment yet, available once its bytes are on disk, unavailable when WhatsApp has expired it, failed when the last attempt broke and may be retried"`
+	// MediaAvailable is derived rather than stored: it says whether get_media
+	// will answer instantly or will have to download first.
+	MediaAvailable bool   `json:"media_available" jsonschema:"true when the attachment is already downloaded, so get_media returns it without touching the network"`
+	Timestamp      string `json:"timestamp" jsonschema:"RFC 3339 timestamp of the message"`
+}
+
+// GetMediaInput are the arguments of get_media.
+type GetMediaInput struct {
+	MessageID string `json:"message_id" jsonschema:"the id of the message whose attachment to download, as list_messages reports it"`
+}
+
+// GetMediaOutput is the result of get_media.
+type GetMediaOutput struct {
+	MessageID string `json:"message_id" jsonschema:"the message the attachment belongs to"`
+	Path      string `json:"path" jsonschema:"the local filesystem path the attachment was written to on the gateway host"`
+	MimeType  string `json:"mime_type,omitempty" jsonschema:"the content type of the file"`
+	MediaType string `json:"media_type,omitempty" jsonschema:"the kind of attachment: image, video, ptt, audio or document"`
+	Status    string `json:"status" jsonschema:"available once the bytes are on disk"`
+	SizeBytes int64  `json:"size_bytes" jsonschema:"the size of the downloaded file in bytes"`
 }
 
 // ListChatsInput are the arguments of list_chats.
@@ -142,6 +163,7 @@ func New(deps Deps) *mcp.Server {
 	registerSendMessage(server, deps)
 	registerFindContact(server, deps)
 	registerSyncHistory(server, deps)
+	registerGetMedia(server, deps)
 
 	return server
 }
@@ -179,11 +201,20 @@ func registerListChats(server *mcp.Server, deps Deps) {
 	})
 }
 
+// registerListMessages registers the reading step.
+//
+// Its description states what the listing will NOT do, because that is the part
+// a model cannot infer: attachments are reported, never downloaded. A listing
+// that quietly pulled files would take seconds instead of milliseconds and
+// would spend disk on every message scrolled past.
 func registerListMessages(server *mcp.Server, deps Deps) {
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "list_messages",
-		Title:       "List messages",
-		Description: "List the messages of one WhatsApp conversation, newest first.",
+		Name:  "list_messages",
+		Title: "List messages",
+		Description: "List the messages of one WhatsApp conversation, newest first. " +
+			"A message that carried an attachment reports media_type and media_status, so the listing always knows the attachment exists. " +
+			"It NEVER downloads one: this call stays fast and predictable, and no media leaves WhatsApp's servers because of it. " +
+			"To get the bytes of an attachment, call get_media with that message's id.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in ListMessagesInput) (*mcp.CallToolResult, ListMessagesOutput, error) {
 		principal, errResult := requireScope(ctx, auth.ScopeMessagesRead)
@@ -214,6 +245,13 @@ func registerListMessages(server *mcp.Server, deps Deps) {
 			}
 			if m.MediaType != nil {
 				msg.MediaType = *m.MediaType
+			}
+			if m.MimeType != nil {
+				msg.MimeType = *m.MimeType
+			}
+			if m.MediaStatus != nil {
+				msg.MediaStatus = *m.MediaStatus
+				msg.MediaAvailable = m.MediaPath != nil && *m.MediaStatus == string(store.MediaAvailable)
 			}
 			out.Messages = append(out.Messages, msg)
 		}
@@ -354,6 +392,53 @@ func registerSyncHistory(server *mcp.Server, deps Deps) {
 	})
 }
 
+// registerGetMedia registers the on-demand download.
+//
+// The description teaches the whole model, because none of it is guessable: the
+// gateway records that a media message exists the moment it arrives but keeps
+// only the reference, the bytes are fetched the first time somebody asks, and
+// an old message may honestly answer that WhatsApp no longer has the file. A
+// model that did not know the last part would retry forever.
+func registerGetMedia(server *mcp.Server, deps Deps) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name:  "get_media",
+		Title: "Get media",
+		Description: "Download the attachment of one WhatsApp message and return the local file path. " +
+			"Use it after list_messages showed a message with a media_type. " +
+			"The gateway stores only a reference to media when a message arrives, never the file, so this is what actually fetches the bytes; " +
+			"the first call downloads and the later ones return the same file without touching the network. " +
+			"Media that WhatsApp has already expired cannot be recovered by anyone: the call then says the media is unavailable, " +
+			"which is a final answer and not worth retrying. " +
+			"Voice notes have media_type ptt. Stickers and gifs are not downloaded by default.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in GetMediaInput) (*mcp.CallToolResult, GetMediaOutput, error) {
+		principal, errResult := requireScope(ctx, auth.ScopeMediaRead)
+		if errResult != nil {
+			return errResult, GetMediaOutput{}, nil
+		}
+		if strings.TrimSpace(in.MessageID) == "" {
+			return toolError("message_id is required"), GetMediaOutput{}, nil
+		}
+
+		ref, err := deps.Sessions.FetchMedia(ctx, principal.TenantID, in.MessageID)
+		if err != nil {
+			deps.Logger.ErrorContext(ctx, "mcp get_media failed",
+				slog.String("tenant_id", principal.TenantID),
+				slog.String("message_id", in.MessageID),
+				slog.String("error", err.Error()))
+			return toolError(describeMediaError(err)), GetMediaOutput{}, nil
+		}
+
+		return nil, GetMediaOutput{
+			MessageID: ref.MessageID,
+			Path:      ref.Path,
+			MimeType:  ref.MimeType,
+			MediaType: ref.MediaType,
+			Status:    ref.Status,
+			SizeBytes: ref.SizeBytes,
+		}, nil
+	})
+}
+
 // requireScope enforces a tool's own scope requirement.
 //
 // The /mcp endpoint authenticates the tenant but cannot enforce a single scope,
@@ -411,6 +496,32 @@ func describeSyncError(err error) string {
 		return "no WhatsApp session exists for this tenant"
 	default:
 		return "could not sync the chat history"
+	}
+}
+
+// describeMediaError turns a fetch failure into something a model can act on.
+//
+// Expired media is spelled out rather than folded into a generic failure: it is
+// the one outcome where the right reaction is to stop asking and tell the user
+// the file is gone.
+func describeMediaError(err error) string {
+	switch {
+	case errors.Is(err, wa.ErrMediaUnavailable):
+		return "WhatsApp no longer has this media; it has expired and cannot be downloaded by anyone, so do not retry"
+	case errors.Is(err, wa.ErrMediaTooLarge):
+		return "this attachment is too large for the gateway to download"
+	case errors.Is(err, wa.ErrMediaTypeNotAllowed):
+		return "the gateway does not download this media type; stickers and gifs are skipped by default"
+	case errors.Is(err, wa.ErrNoMedia):
+		return "this message carries no downloadable media"
+	case errors.Is(err, wa.ErrUnknownMessage):
+		return "no message with that id exists for this tenant; take the id from list_messages"
+	case errors.Is(err, wa.ErrNotPaired):
+		return "this tenant has no paired WhatsApp session; pair a number first"
+	case errors.Is(err, wa.ErrUnknownTenant):
+		return "no WhatsApp session exists for this tenant"
+	default:
+		return "could not download the media"
 	}
 }
 

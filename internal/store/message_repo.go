@@ -18,13 +18,24 @@ const (
 
 type messageRepo struct{ db *sql.DB }
 
-const messageColumns = `id, tenant_id, chat_jid, sender_jid, wa_message_id, direction, body, media_type, media_path, timestamp, created_at`
+// messageColumns is the read projection, and also the insert projection: the
+// media_* bookkeeping columns at the end are written by UpdateMedia rather than
+// by an insert, because a fresh row has never been fetched.
+const messageColumns = `id, tenant_id, chat_jid, sender_jid, wa_message_id, direction, body,
+	 media_type, media_path, direct_path, media_key, file_enc_sha256, file_sha256, file_length,
+	 mime_type, mms_type, media_status, media_error, media_fetched_at, timestamp, created_at`
+
+// insertColumns is messageColumns without the three fetch-bookkeeping columns,
+// which an insert always leaves NULL.
+const insertColumns = `id, tenant_id, chat_jid, sender_jid, wa_message_id, direction, body,
+	 media_type, media_path, direct_path, media_key, file_enc_sha256, file_sha256, file_length,
+	 mime_type, mms_type, timestamp, created_at`
 
 // insertMessage is the single INSERT both Append and AppendBatch run. The
 // conflict clause is what makes a redelivery — by the live stream or by a
 // history sync — a no-op.
-const insertMessage = `INSERT INTO messages (` + messageColumns + `)
-	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+const insertMessage = `INSERT INTO messages (` + insertColumns + `)
+	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	 ON CONFLICT (tenant_id, wa_message_id) DO NOTHING`
 
 // prepareMessage validates a message and fills in the fields a caller may leave
@@ -56,7 +67,9 @@ func prepareMessage(m Message) (Message, error) {
 func messageArgs(m Message) []any {
 	return []any{
 		m.ID, m.TenantID, m.ChatJID, m.SenderJID, m.WAMessageID, string(m.Direction),
-		m.Body, m.MediaType, m.MediaPath, m.Timestamp.UTC(), m.CreatedAt.UTC(),
+		m.Body, m.MediaType, m.MediaPath, m.DirectPath, m.MediaKey, m.FileEncSHA256,
+		m.FileSHA256, m.FileLength, m.MimeType, m.MMSType,
+		m.Timestamp.UTC(), m.CreatedAt.UTC(),
 	}
 }
 
@@ -263,27 +276,131 @@ func collectMessages(rows *sql.Rows) ([]Message, error) {
 	var out []Message
 	for rows.Next() {
 		var (
-			m         Message
-			direction string
-			mediaType sql.NullString
-			mediaPath sql.NullString
+			m              Message
+			direction      string
+			mediaType      sql.NullString
+			mediaPath      sql.NullString
+			directPath     sql.NullString
+			fileLength     sql.NullInt64
+			mimeType       sql.NullString
+			mmsType        sql.NullString
+			mediaStatus    sql.NullString
+			mediaError     sql.NullString
+			mediaFetchedAt sql.NullTime
 		)
 		if err := rows.Scan(&m.ID, &m.TenantID, &m.ChatJID, &m.SenderJID, &m.WAMessageID,
-			&direction, &m.Body, &mediaType, &mediaPath, &m.Timestamp, &m.CreatedAt); err != nil {
+			&direction, &m.Body, &mediaType, &mediaPath, &directPath, &m.MediaKey,
+			&m.FileEncSHA256, &m.FileSHA256, &fileLength, &mimeType, &mmsType,
+			&mediaStatus, &mediaError, &mediaFetchedAt, &m.Timestamp, &m.CreatedAt); err != nil {
 			return nil, fmt.Errorf("store: scan message: %w", err)
 		}
 		m.Direction = Direction(direction)
-		if mediaType.Valid {
-			v := mediaType.String
-			m.MediaType = &v
+		m.MediaType = nullableString(mediaType)
+		m.MediaPath = nullableString(mediaPath)
+		m.DirectPath = nullableString(directPath)
+		m.MimeType = nullableString(mimeType)
+		m.MMSType = nullableString(mmsType)
+		m.MediaStatus = nullableString(mediaStatus)
+		m.MediaError = nullableString(mediaError)
+		if fileLength.Valid {
+			v := fileLength.Int64
+			m.FileLength = &v
 		}
-		if mediaPath.Valid {
-			v := mediaPath.String
-			m.MediaPath = &v
+		if mediaFetchedAt.Valid {
+			v := mediaFetchedAt.Time.UTC()
+			m.MediaFetchedAt = &v
 		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// nullableString turns a nullable column into the pointer the model uses, so a
+// SQL NULL and an absent value stay the same thing all the way up.
+func nullableString(v sql.NullString) *string {
+	if !v.Valid {
+		return nil
+	}
+	s := v.String
+	return &s
+}
+
+// GetByID returns one message of a tenant, addressed by either identifier.
+//
+// Callers reach a message through whatever id they were handed: MCP tools and
+// the HTTP listing expose the gateway's own id, while anything derived from a
+// WhatsApp event carries the wa_message_id. Accepting both here keeps that
+// detail out of every caller. The tenant is always part of the lookup, so an id
+// belonging to somebody else simply does not exist.
+func (r *messageRepo) GetByID(ctx context.Context, tenantID, id string) (Message, error) {
+	if tenantID == "" || id == "" {
+		return Message{}, ErrNotFound
+	}
+
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT `+messageColumns+`
+		 FROM messages
+		 WHERE tenant_id = ? AND (id = ? OR wa_message_id = ?)
+		 ORDER BY timestamp DESC, id DESC
+		 LIMIT 1`,
+		tenantID, id, id)
+	if err != nil {
+		return Message{}, fmt.Errorf("store: get message: %w", err)
+	}
+	found, err := collectMessages(rows)
+	if err != nil {
+		return Message{}, err
+	}
+	if len(found) == 0 {
+		return Message{}, ErrNotFound
+	}
+	return found[0], nil
+}
+
+// UpdateMedia records the outcome of a fetch attempt.
+//
+// Only the media bookkeeping columns are written. The message, its body and its
+// download reference are all left exactly as they were, so a download that
+// fails — or one that comes back 410 because WhatsApp dropped the file — costs
+// nothing but the attempt.
+func (r *messageRepo) UpdateMedia(ctx context.Context, tenantID, id string, upd MediaUpdate) error {
+	if tenantID == "" || id == "" {
+		return ErrNotFound
+	}
+	if upd.FetchedAt.IsZero() {
+		upd.FetchedAt = time.Now().UTC()
+	}
+
+	var mediaError any
+	if upd.Error != "" {
+		mediaError = upd.Error
+	}
+	// A successful fetch is the only thing that sets a path; every other
+	// outcome leaves the previous one alone rather than inventing a NULL.
+	var mediaPath any
+	if upd.Path != nil {
+		mediaPath = *upd.Path
+	}
+
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE messages
+		 SET media_path       = coalesce(?, media_path),
+		     media_status     = ?,
+		     media_error      = ?,
+		     media_fetched_at = ?
+		 WHERE tenant_id = ? AND id = ?`,
+		mediaPath, string(upd.Status), mediaError, upd.FetchedAt.UTC(), tenantID, id)
+	if err != nil {
+		return fmt.Errorf("store: update message media: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: update message media: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func normalizeLimit(limit int) int {

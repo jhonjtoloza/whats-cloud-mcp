@@ -17,6 +17,7 @@ type fakeSessionManager struct {
 	sendCalls    []sendCall
 	contactCalls []contactCall
 	syncCalls    []syncCall
+	mediaCalls   []mediaCall
 
 	pairResult  wa.PairingResult
 	pairErr     error
@@ -30,6 +31,8 @@ type fakeSessionManager struct {
 	contactsErr error
 	syncResult  wa.SyncResult
 	syncErr     error
+	mediaRef    wa.MediaRef
+	mediaErr    error
 }
 
 type pairCall struct {
@@ -52,6 +55,11 @@ type syncCall struct {
 	TenantID string
 	ChatJID  string
 	Count    int
+}
+
+type mediaCall struct {
+	TenantID  string
+	MessageID string
 }
 
 func (f *fakeSessionManager) StartPairing(_ context.Context, tenantID, phone string) (wa.PairingResult, error) {
@@ -134,6 +142,31 @@ func (f *fakeSessionManager) SyncHistory(_ context.Context, tenantID, chatJID st
 		result.ChatJID = chatJID
 	}
 	return result, nil
+}
+
+// FetchMedia stands in for the lazy download. The real one needs a socket and a
+// live media connection; here the test decides what the fetch would have found.
+func (f *fakeSessionManager) FetchMedia(_ context.Context, tenantID, messageID string) (wa.MediaRef, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.mediaCalls = append(f.mediaCalls, mediaCall{TenantID: tenantID, MessageID: messageID})
+	if f.mediaErr != nil {
+		return wa.MediaRef{}, f.mediaErr
+	}
+	ref := f.mediaRef
+	if ref.MessageID == "" {
+		ref.MessageID = messageID
+	}
+	return ref, nil
+}
+
+func (f *fakeSessionManager) snapshotMediaCalls() []mediaCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]mediaCall, len(f.mediaCalls))
+	copy(out, f.mediaCalls)
+	return out
 }
 
 func (f *fakeSessionManager) snapshotContactCalls() []contactCall {

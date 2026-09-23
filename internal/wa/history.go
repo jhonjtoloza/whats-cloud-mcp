@@ -127,9 +127,10 @@ func historyRecords(
 		if key.GetFromMe() {
 			record.Direction = store.DirectionOut
 		}
-		if mediaType := historyMediaType(info.GetMessage()); mediaType != "" {
-			record.MediaType = &mediaType
-		}
+		// The reference, never the bytes: a history sync can deliver thousands
+		// of attachments at once, and downloading them here would be the exact
+		// eager fetch this design refuses.
+		applyMediaReference(&record, mediaReference(info.GetMessage()))
 		records = append(records, record)
 	}
 
@@ -173,50 +174,15 @@ func historySender(ownJID, chat types.JID, fromMe bool, participant string) stri
 // it carries none.
 //
 // The live path gets this for free in events.Message.Info.MediaType. History
-// messages have no such field, so the type is derived from the payload here,
-// using the same vocabulary whatsmeow puts on the live info ("image", "ptt",
-// "gif", ...) so both paths store comparable values.
+// messages have no such field, so the type is derived from the payload, using
+// the same vocabulary whatsmeow puts on the live info ("image", "ptt", "gif",
+// ...) so both paths store comparable values.
+//
+// It is a thin reading of mediaReference on purpose: the type and the download
+// reference are decided by one function, which is the only way the two
+// persistence paths can be kept from drifting apart.
 func historyMediaType(msg *waProto.Message) string {
-	if msg == nil {
-		return ""
-	}
-
-	switch {
-	// Wrappers carry the real message inside them.
-	case msg.GetEphemeralMessage() != nil:
-		return historyMediaType(msg.GetEphemeralMessage().GetMessage())
-	case msg.GetViewOnceMessage() != nil:
-		return historyMediaType(msg.GetViewOnceMessage().GetMessage())
-	case msg.GetViewOnceMessageV2() != nil:
-		return historyMediaType(msg.GetViewOnceMessageV2().GetMessage())
-	case msg.GetViewOnceMessageV2Extension() != nil:
-		return historyMediaType(msg.GetViewOnceMessageV2Extension().GetMessage())
-	case msg.GetDocumentWithCaptionMessage() != nil:
-		return historyMediaType(msg.GetDocumentWithCaptionMessage().GetMessage())
-
-	case msg.GetImageMessage() != nil:
-		return "image"
-	case msg.GetStickerMessage() != nil:
-		return "sticker"
-	case msg.GetDocumentMessage() != nil:
-		return "document"
-	case msg.GetAudioMessage() != nil:
-		if msg.GetAudioMessage().GetPTT() {
-			return "ptt"
-		}
-		return "audio"
-	case msg.GetVideoMessage() != nil:
-		if msg.GetVideoMessage().GetGifPlayback() {
-			return "gif"
-		}
-		return "video"
-	case msg.GetContactMessage() != nil:
-		return "vcard"
-	case msg.GetLocationMessage() != nil, msg.GetLiveLocationMessage() != nil:
-		return "location"
-	default:
-		return ""
-	}
+	return mediaReference(msg).MediaType
 }
 
 // persistHistorySync stores a pushed history sync.

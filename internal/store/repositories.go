@@ -49,6 +49,17 @@ type Messages interface {
 	// same (tenant_id, wa_message_id) uniqueness makes a replay a no-op, so the
 	// returned count is the honest "new history" number.
 	AppendBatch(ctx context.Context, messages []Message) (int, error)
+	// GetByID returns one message of a tenant, addressed by the gateway's own
+	// id or by the WhatsApp message id, or ErrNotFound when neither matches.
+	//
+	// The tenant is part of the lookup rather than a check afterwards, so an id
+	// belonging to another tenant is indistinguishable from one that never
+	// existed.
+	GetByID(ctx context.Context, tenantID, id string) (Message, error)
+	// UpdateMedia records the outcome of a media fetch. It writes the media
+	// bookkeeping columns and nothing else: a failed download must never lose
+	// the message or its download reference.
+	UpdateMedia(ctx context.Context, tenantID, id string, upd MediaUpdate) error
 	// OldestByChat returns the oldest stored message of a chat, or ErrNotFound
 	// when the chat has none.
 	//

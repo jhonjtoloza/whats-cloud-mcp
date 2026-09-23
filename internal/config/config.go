@@ -25,6 +25,44 @@ const defaultBindAddr = "127.0.0.1:8080"
 // be asleep, so this is generous by design.
 const DefaultHistorySyncTimeout = 30 * time.Second
 
+// DefaultMediaDir is where downloaded media is written when MEDIA_DIR is unset.
+const DefaultMediaDir = "./data/media"
+
+// DefaultMediaMaxBytes refuses a single attachment above 100 MiB.
+//
+// The gateway shares a small server with other things and media is fetched on
+// demand rather than in advance, so the limit is about one request, not about a
+// quota: a single video must not be able to fill the disk.
+const DefaultMediaMaxBytes = 100 << 20 // 100 MiB
+
+// knownMediaTypes is every media type the gateway records a reference for.
+//
+// References are stored for all of them because a reference is a few hundred
+// bytes; MEDIA_FETCH_TYPES decides which of them may be turned into a file.
+// vcard and location name a type and carry no bytes, so they are not fetchable
+// and are not listed here.
+var knownMediaTypes = map[string]bool{
+	"ptt":      true,
+	"audio":    true,
+	"image":    true,
+	"video":    true,
+	"document": true,
+	"sticker":  true,
+	"gif":      true,
+}
+
+// DefaultMediaFetchTypes returns the media types downloaded when
+// MEDIA_FETCH_TYPES is unset.
+//
+// Stickers and gifs are deliberately out. They are the two types nobody asks an
+// assistant to read back, and they are numerous enough that fetching them would
+// be most of the disk for none of the value. Their references are still stored,
+// so opting them in later costs one environment variable and no backfill.
+func DefaultMediaFetchTypes() []string {
+	// A fresh slice per call: the defaults are not a caller's to rewrite.
+	return []string{"ptt", "audio", "image", "video", "document"}
+}
+
 // HistorySyncScope says which chat types a pushed history sync is stored in
 // full for.
 //
@@ -70,6 +108,11 @@ type Gateway struct {
 	// HistorySyncTimeout bounds how long an on-demand backfill waits for the
 	// phone to answer.
 	HistorySyncTimeout time.Duration
+	// MediaMaxBytes is the largest attachment the gateway will download.
+	MediaMaxBytes int64
+	// MediaFetchTypes are the media types an on-demand fetch may download. A
+	// reference is stored for every type either way.
+	MediaFetchTypes []string
 }
 
 // LoadGateway reads the gateway configuration from the environment.
@@ -77,7 +120,7 @@ func LoadGateway() (Gateway, error) {
 	cfg := Gateway{
 		AdminToken:        strings.TrimSpace(os.Getenv("ADMIN_TOKEN")),
 		DBPath:            envOr("DB_PATH", "./data/whats-cloud.db"),
-		MediaDir:          envOr("MEDIA_DIR", "./data/media"),
+		MediaDir:          envOr("MEDIA_DIR", DefaultMediaDir),
 		MCPAllowedOrigins: splitList(os.Getenv("MCP_ALLOWED_ORIGINS")),
 		LogLevel:          ParseLogLevel(os.Getenv("LOG_LEVEL")),
 		ShutdownTimeout:   15 * time.Second,
@@ -109,7 +152,57 @@ func LoadGateway() (Gateway, error) {
 	}
 	cfg.HistorySyncTimeout = timeout
 
+	maxBytes, err := ParseMediaMaxBytes(os.Getenv("MEDIA_MAX_BYTES"))
+	if err != nil {
+		return Gateway{}, err
+	}
+	cfg.MediaMaxBytes = maxBytes
+
+	fetchTypes, err := ParseMediaFetchTypes(os.Getenv("MEDIA_FETCH_TYPES"))
+	if err != nil {
+		return Gateway{}, err
+	}
+	cfg.MediaFetchTypes = fetchTypes
+
 	return cfg, nil
+}
+
+// ParseMediaMaxBytes reads MEDIA_MAX_BYTES as a plain byte count.
+//
+// A count rather than a "100MiB" string: the value guards a shared disk, and an
+// unparsed unit suffix that silently became a byte count would be the worst way
+// to discover the difference.
+func ParseMediaMaxBytes(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return DefaultMediaMaxBytes, nil
+	}
+	maxBytes, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: MEDIA_MAX_BYTES %q is not a byte count", raw)
+	}
+	if maxBytes <= 0 {
+		return 0, fmt.Errorf("config: MEDIA_MAX_BYTES %q must be positive", raw)
+	}
+	return maxBytes, nil
+}
+
+// ParseMediaFetchTypes reads MEDIA_FETCH_TYPES.
+//
+// An unrecognised type is an error rather than a silent drop: the setting
+// decides which attachments can ever be downloaded, and a typo would present
+// itself as media that mysteriously never arrives.
+func ParseMediaFetchTypes(raw string) ([]string, error) {
+	parts := splitList(strings.ToLower(raw))
+	if len(parts) == 0 {
+		return DefaultMediaFetchTypes(), nil
+	}
+	for _, part := range parts {
+		if !knownMediaTypes[part] {
+			return nil, fmt.Errorf("config: MEDIA_FETCH_TYPES %q names an unknown media type %q", raw, part)
+		}
+	}
+	return parts, nil
 }
 
 // ParseHistorySyncScope reads HISTORY_SYNC_SCOPE.

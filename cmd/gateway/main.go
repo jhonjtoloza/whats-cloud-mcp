@@ -115,6 +115,11 @@ func run() error {
 	manager, err := wa.NewManager(ctx, db, logger, wa.ManagerOptions{
 		HistoryScope:   cfg.HistorySyncScope,
 		HistoryTimeout: cfg.HistorySyncTimeout,
+		// Media is fetched on demand, so these bound one request rather than a
+		// background job: nothing writes into MediaDir until somebody asks.
+		MediaDir:        cfg.MediaDir,
+		MediaMaxBytes:   cfg.MediaMaxBytes,
+		MediaFetchTypes: cfg.MediaFetchTypes,
 	})
 	if err != nil {
 		return err

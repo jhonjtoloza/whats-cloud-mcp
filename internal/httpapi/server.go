@@ -108,6 +108,9 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("GET /v1/chats/{jid}/messages", scope(auth.ScopeMessagesRead)(http.HandlerFunc(s.handleListChatMessages)))
 	mux.Handle("POST /v1/chats/{jid}/sync", scope(auth.ScopeMessagesRead)(http.HandlerFunc(s.handleSyncChatHistory)))
 	mux.Handle("GET /v1/contacts", scope(auth.ScopeMessagesRead)(http.HandlerFunc(s.handleFindContacts)))
+	// Media is its own permission: reading a conversation's text is not the
+	// same as pulling its files off WhatsApp's servers onto this disk.
+	mux.Handle("GET /v1/messages/{id}/media", scope(auth.ScopeMediaRead)(http.HandlerFunc(s.handleGetMessageMedia)))
 
 	// MCP over Streamable HTTP, in this same process.
 	//

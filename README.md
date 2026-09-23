@@ -66,6 +66,11 @@ Scopes: `messages:send`, `messages:read`, `media:read`, `media:write`,
 `sessions:read`. A grant may be exact (`messages:send`), a resource wildcard
 (`media:*`) or the global wildcard (`*`). A missing scope always denies.
 
+`media:read` is separate from `messages:read` on purpose: reading the text of a
+conversation is not the same as pulling its files out of WhatsApp and onto this
+disk. `media:write` currently guards nothing — the gateway does not send media
+yet — and is left unused rather than given a route invented to justify it.
+
 ### Why SHA-256 and not bcrypt or argon2
 
 These keys are 32 bytes straight out of `crypto/rand`, not human-chosen
@@ -112,6 +117,7 @@ number never invalidates or rotates an API key.** It is asserted by
 | `GET` | `/v1/chats/{jid}/messages` | `messages:read` | `?limit=`, newest first |
 | `POST` | `/v1/chats/{jid}/sync` | `messages:read` | `{count?}` (default 50, max 200); backfills older history |
 | `GET` | `/v1/contacts` | `messages:read` | `?q=` name, business name or phone number |
+| `GET` | `/v1/messages/{id}/media` | `media:read` | downloads the attachment on demand and streams it; `410` when WhatsApp has expired it |
 | `POST` | `/mcp` | tenant key | MCP over Streamable HTTP |
 
 Errors always share one shape:
@@ -122,7 +128,7 @@ Errors always share one shape:
 
 ## MCP
 
-Five tools, served at `/mcp`:
+Six tools, served at `/mcp`:
 
 | Tool | Arguments | Required scope |
 |---|---|---|
@@ -131,6 +137,7 @@ Five tools, served at `/mcp`:
 | `send_message` | `to`, `body` | `messages:send` |
 | `find_contact` | `query` | `messages:read` |
 | `sync_history` | `chat_jid`, `count?` | `messages:read` |
+| `get_media` | `message_id` | `media:read` |
 
 The intended reading sequence is `find_contact` → `list_messages` → and, when
 the stored conversation is missing or too shallow, `sync_history` followed by
@@ -376,9 +383,15 @@ Tests are table-driven and use the standard `testing` package only. The MCP
 tests drive the real SDK client over the real Streamable HTTP transport against
 an `httptest` server, rather than calling the tool functions directly.
 
-The whatsmeow-backed `wa.Manager` has no unit tests on purpose — every
-meaningful path needs a live socket — so `httpapi` and MCP tests run against a
+Most of the whatsmeow-backed `wa.Manager` has no unit tests on purpose — those
+paths need a live socket — so `httpapi` and MCP tests run against a
 `fakeSessionManager` behind the `wa.SessionManager` interface.
+
+The media fetcher is the exception, and deliberately so: the download itself
+sits behind a one-method interface that the real `*whatsmeow.Client` satisfies,
+which leaves the parts worth testing — path safety, the size guard, the type
+allowlist, expiry handling, idempotency and the tenant scoping — covered without
+a socket, a network or a GPU.
 
 ## History sync
 
@@ -411,6 +424,60 @@ is to get a message into that chat first.
 
 Both paths write through the same unique `(tenant_id, wa_message_id)` index, so
 history and the live stream can never duplicate each other.
+
+## Media
+
+**Media is downloaded lazily and never eagerly.** Not when a message arrives,
+not during a history sync, not by a background job. When a media message is
+stored, the row records the *reference* — direct path, media key, both hashes,
+length, mime type and CDN type — and nothing else. The bytes are fetched the
+first time `GET /v1/messages/{id}/media` or the `get_media` tool asks for them.
+
+The reason is arithmetic. Eagerly downloading every image, video and sticker a
+WhatsApp account has ever received would fill a small shared server with data
+nobody reads. A reference is a few hundred bytes, so keeping one for every
+attachment costs nothing and keeps every message fetchable later.
+
+It works because whatsmeow can download by reference alone, with no original
+message object:
+
+```go
+func (cli *Client) DownloadMediaWithPath(ctx context.Context, directPath string,
+    encFileHash, fileHash, mediaKey []byte, mediaType MediaType, mmsType string,
+    allowNoHash bool) (data []byte, err error)
+```
+
+**The tradeoff, handled rather than hidden:** WhatsApp expires media
+server-side, so a reference can outlive its bytes. A fetch that comes back 403,
+404 or 410 means the file is gone for everyone, permanently. That is recorded as
+`media_status = 'unavailable'`, answered with `410 Gone` over HTTP and a plain
+"do not retry" over MCP, and **never attempted again**. Any other failure is
+`failed` and may be retried. Either way only the `media_*` columns move: a
+failed download never costs the message.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `MEDIA_DIR` | `./data/media` | root of the media tree; each tenant gets a subdirectory, mode `0750` |
+| `MEDIA_MAX_BYTES` | `104857600` (100 MiB) | refuses bigger attachments, checked against the declared length *before* downloading and against the real size after |
+| `MEDIA_FETCH_TYPES` | `ptt,audio,image,video,document` | which types may be downloaded |
+
+`MEDIA_FETCH_TYPES` gates the bytes, not the bookkeeping: references are stored
+for every type, stickers and gifs included, so widening the list later needs no
+backfill. They are out by default because they are numerous and nobody asks an
+assistant to read a sticker back.
+
+**Path safety.** The file name is the SHA-256 of the message id, never the id
+itself. WhatsApp message ids arrive from the network, and one used verbatim
+could carry `../`, an absolute path or a NUL and walk out of the media
+directory. Hashing removes the class instead of filtering it; the extension
+comes from a fixed mime-type table; the tenant segment is charset-validated; and
+the finished path is checked to be inside the tenant's own directory. Tenants
+never share a directory, so one tenant's message id cannot reach another's file.
+
+Neither the filesystem path nor any key material is ever returned over HTTP. The
+`media_key` and the two hashes are secrets — they decrypt the file on WhatsApp's
+CDN — so anything that dumps or exports the `messages` table is handling key
+material, not metadata.
 
 ## Notes on search
 
