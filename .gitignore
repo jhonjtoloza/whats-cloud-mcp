@@ -30,3 +30,6 @@ media/
 .idea/
 .vscode/
 *.swp
+
+# Local agent tooling cache, not part of the project.
+/.atl/
