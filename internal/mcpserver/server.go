@@ -82,6 +82,37 @@ type SendMessageOutput struct {
 	To          string `json:"to" jsonschema:"the destination the message was sent to"`
 }
 
+// FindContactInput are the arguments of find_contact.
+type FindContactInput struct {
+	Query string `json:"query" jsonschema:"a name, business name or phone number to look for; matching is case-insensitive and partial"`
+}
+
+// ContactCandidate is one match of find_contact.
+type ContactCandidate struct {
+	JID         string `json:"jid" jsonschema:"the WhatsApp JID to use with list_messages, sync_history or send_message"`
+	Name        string `json:"name" jsonschema:"the best display name known for this contact"`
+	HasMessages bool   `json:"has_messages" jsonschema:"true when messages for this chat are already stored and can be read straight away"`
+}
+
+// FindContactOutput is the result of find_contact.
+type FindContactOutput struct {
+	Contacts []ContactCandidate `json:"contacts" jsonschema:"matching contacts, ordered by name"`
+}
+
+// SyncHistoryInput are the arguments of sync_history.
+type SyncHistoryInput struct {
+	ChatJID string `json:"chat_jid" jsonschema:"the WhatsApp chat JID to backfill, for example 5215550001111@s.whatsapp.net"`
+	Count   int    `json:"count,omitempty" jsonschema:"how many older messages to request; defaults to 50 and is capped at 200"`
+}
+
+// SyncHistoryOutput is the result of sync_history.
+type SyncHistoryOutput struct {
+	ChatJID         string `json:"chat_jid" jsonschema:"the conversation that was backfilled"`
+	Inserted        int    `json:"inserted" jsonschema:"how many messages were new; zero means nothing older arrived"`
+	OldestTimestamp string `json:"oldest_timestamp" jsonschema:"RFC 3339 timestamp of the oldest message now stored for this chat"`
+	MoreAvailable   bool   `json:"more_available" jsonschema:"true when calling sync_history again is likely to bring more history"`
+}
+
 // Deps are what the tools need to do their work in-process.
 type Deps struct {
 	Messages store.Messages
@@ -89,7 +120,7 @@ type Deps struct {
 	Logger   *slog.Logger
 }
 
-// New builds the MCP server and registers the three tools.
+// New builds the MCP server and registers its tools.
 //
 // The returned server is safe to share across requests: it holds no
 // per-caller state, because every tool resolves its tenant from the context of
@@ -109,6 +140,8 @@ func New(deps Deps) *mcp.Server {
 	registerListChats(server, deps)
 	registerListMessages(server, deps)
 	registerSendMessage(server, deps)
+	registerFindContact(server, deps)
+	registerSyncHistory(server, deps)
 
 	return server
 }
@@ -236,6 +269,91 @@ func registerSendMessage(server *mcp.Server, deps Deps) {
 	})
 }
 
+// registerFindContact registers the entry point of the read flow.
+//
+// The description spells out the sequence because a model has no other way to
+// learn it: a JID is not guessable from a name, and the gateway only stores what
+// WhatsApp has already pushed to it.
+func registerFindContact(server *mcp.Server, deps Deps) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name:  "find_contact",
+		Title: "Find contact",
+		Description: "Find the WhatsApp JID of a contact by name, business name or phone number. " +
+			"This is the first step when the user names a person rather than a JID: search here, then read the conversation with list_messages. " +
+			"Each candidate reports has_messages; when it is false, or the stored conversation turns out to be too short to answer the question, " +
+			"call sync_history for that JID to pull older messages and then read it again.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in FindContactInput) (*mcp.CallToolResult, FindContactOutput, error) {
+		principal, errResult := requireScope(ctx, auth.ScopeMessagesRead)
+		if errResult != nil {
+			return errResult, FindContactOutput{}, nil
+		}
+		if in.Query == "" {
+			return toolError("query is required"), FindContactOutput{}, nil
+		}
+
+		contacts, err := deps.Sessions.FindContacts(ctx, principal.TenantID, in.Query)
+		if err != nil {
+			deps.Logger.ErrorContext(ctx, "mcp find_contact failed",
+				slog.String("tenant_id", principal.TenantID), slog.String("error", err.Error()))
+			return toolError(describeSyncError(err)), FindContactOutput{}, nil
+		}
+
+		out := FindContactOutput{Contacts: make([]ContactCandidate, 0, len(contacts))}
+		for _, c := range contacts {
+			out.Contacts = append(out.Contacts, ContactCandidate{
+				JID:         c.JID,
+				Name:        c.Name,
+				HasMessages: c.HasMessages,
+			})
+		}
+		return nil, out, nil
+	})
+}
+
+// registerSyncHistory registers the backfill step.
+//
+// The anchor requirement is stated in the description on purpose: it is a
+// constraint of WhatsApp's on-demand history rather than of this gateway, and a
+// model that does not know it would keep retrying a call that can never work.
+func registerSyncHistory(server *mcp.Server, deps Deps) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name:  "sync_history",
+		Title: "Sync chat history",
+		Description: "Ask the user's phone for older messages of one conversation, then store them. " +
+			"Use it when list_messages returns nothing, or too little to answer the question, after find_contact gave you the chat JID; " +
+			"call list_messages again afterwards to read what arrived. " +
+			"The chat MUST already have at least one stored message to anchor the request on: WhatsApp only returns the messages immediately " +
+			"before a message it can identify, so a conversation the gateway has never seen cannot be backfilled and must first appear in a " +
+			"pushed history sync or receive a message. " +
+			"The call waits for the phone to answer and may take a few seconds; repeat it to walk further back while more_available is true.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in SyncHistoryInput) (*mcp.CallToolResult, SyncHistoryOutput, error) {
+		principal, errResult := requireScope(ctx, auth.ScopeMessagesRead)
+		if errResult != nil {
+			return errResult, SyncHistoryOutput{}, nil
+		}
+		if in.ChatJID == "" {
+			return toolError("chat_jid is required"), SyncHistoryOutput{}, nil
+		}
+
+		result, err := deps.Sessions.SyncHistory(ctx, principal.TenantID, in.ChatJID, wa.NormalizeSyncCount(in.Count))
+		if err != nil {
+			deps.Logger.ErrorContext(ctx, "mcp sync_history failed",
+				slog.String("tenant_id", principal.TenantID),
+				slog.String("chat_jid", in.ChatJID),
+				slog.String("error", err.Error()))
+			return toolError(describeSyncError(err)), SyncHistoryOutput{}, nil
+		}
+
+		return nil, SyncHistoryOutput{
+			ChatJID:         result.ChatJID,
+			Inserted:        result.Inserted,
+			OldestTimestamp: formatTime(result.OldestTimestamp),
+			MoreAvailable:   result.MoreAvailable,
+		}, nil
+	})
+}
+
 // requireScope enforces a tool's own scope requirement.
 //
 // The /mcp endpoint authenticates the tenant but cannot enforce a single scope,
@@ -273,6 +391,26 @@ func describeSendError(err error) string {
 		return "no WhatsApp session exists for this tenant"
 	default:
 		return "could not send the message"
+	}
+}
+
+// describeSyncError turns a backfill failure into something a model can act on.
+func describeSyncError(err error) string {
+	switch {
+	case errors.Is(err, wa.ErrNoAnchorMessage):
+		return "this chat has no stored message to anchor a history request on; it must appear in a pushed history sync or receive a message before it can be backfilled"
+	case errors.Is(err, wa.ErrSyncInProgress):
+		return "a history sync for this chat is already running; wait for it to finish before asking again"
+	case errors.Is(err, wa.ErrSyncTimeout):
+		return "the phone did not answer the history request in time; it may still arrive, so read the chat again shortly"
+	case errors.Is(err, wa.ErrNotPaired):
+		return "this tenant has no paired WhatsApp session; pair a number first"
+	case errors.Is(err, wa.ErrInvalidJID):
+		return "the chat is not a valid WhatsApp JID"
+	case errors.Is(err, wa.ErrUnknownTenant):
+		return "no WhatsApp session exists for this tenant"
+	default:
+		return "could not sync the chat history"
 	}
 }
 

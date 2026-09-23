@@ -619,3 +619,183 @@ func TestNewIDIsUnique(t *testing.T) {
 		seen[id] = struct{}{}
 	}
 }
+
+// TestMessageAppendBatchIsIdempotent is the dedup contract between a pushed
+// history sync and the live message stream: both deliver the same
+// wa_message_id, and the unique (tenant_id, wa_message_id) index must make the
+// second delivery a no-op.
+func TestMessageAppendBatchIsIdempotent(t *testing.T) {
+	db := newTestDB(t)
+	mustTenant(t, db, "tenant-a", "Acme")
+	ctx := context.Background()
+
+	base := time.Date(2026, 3, 1, 8, 0, 0, 0, time.UTC)
+	batch := []store.Message{
+		{TenantID: "tenant-a", ChatJID: "chat-h", SenderJID: "chat-h", WAMessageID: "h1", Direction: store.DirectionIn, Body: "one", Timestamp: base},
+		{TenantID: "tenant-a", ChatJID: "chat-h", SenderJID: "me", WAMessageID: "h2", Direction: store.DirectionOut, Body: "two", Timestamp: base.Add(time.Minute)},
+	}
+
+	inserted, err := db.Messages().AppendBatch(ctx, batch)
+	if err != nil {
+		t.Fatalf("AppendBatch() error = %v", err)
+	}
+	if inserted != 2 {
+		t.Fatalf("first AppendBatch() inserted %d, want 2", inserted)
+	}
+
+	countRows := func() int {
+		t.Helper()
+		var n int
+		if err := db.SQL().QueryRowContext(ctx,
+			`SELECT count(*) FROM messages WHERE tenant_id = 'tenant-a'`).Scan(&n); err != nil {
+			t.Fatalf("count error = %v", err)
+		}
+		return n
+	}
+	afterFirst := countRows()
+
+	inserted, err = db.Messages().AppendBatch(ctx, batch)
+	if err != nil {
+		t.Fatalf("second AppendBatch() error = %v", err)
+	}
+	if inserted != 0 {
+		t.Errorf("second AppendBatch() inserted %d, want 0", inserted)
+	}
+	if got := countRows(); got != afterFirst {
+		t.Errorf("row count = %d after replaying the batch, want %d", got, afterFirst)
+	}
+}
+
+// TestMessageAppendBatchDedupsAgainstLiveMessages proves a history row cannot
+// duplicate a message the live event stream already stored.
+func TestMessageAppendBatchDedupsAgainstLiveMessages(t *testing.T) {
+	db := newTestDB(t)
+	mustTenant(t, db, "tenant-a", "Acme")
+	ctx := context.Background()
+
+	at := time.Date(2026, 3, 1, 8, 0, 0, 0, time.UTC)
+	if err := db.Messages().Append(ctx, store.Message{
+		TenantID: "tenant-a", ChatJID: "chat-h", SenderJID: "chat-h",
+		WAMessageID: "live-1", Direction: store.DirectionIn, Body: "live", Timestamp: at,
+	}); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+
+	inserted, err := db.Messages().AppendBatch(ctx, []store.Message{
+		{TenantID: "tenant-a", ChatJID: "chat-h", SenderJID: "chat-h", WAMessageID: "live-1", Direction: store.DirectionIn, Body: "live", Timestamp: at},
+		{TenantID: "tenant-a", ChatJID: "chat-h", SenderJID: "chat-h", WAMessageID: "hist-1", Direction: store.DirectionIn, Body: "older", Timestamp: at.Add(-time.Hour)},
+	})
+	if err != nil {
+		t.Fatalf("AppendBatch() error = %v", err)
+	}
+	if inserted != 1 {
+		t.Errorf("AppendBatch() inserted %d, want 1 (the live message was already stored)", inserted)
+	}
+}
+
+func TestMessageAppendBatchRejectsInvalidRows(t *testing.T) {
+	db := newTestDB(t)
+	mustTenant(t, db, "tenant-a", "Acme")
+	ctx := context.Background()
+
+	tests := []struct {
+		name string
+		msg  store.Message
+	}{
+		{"no tenant", store.Message{ChatJID: "c", WAMessageID: "w", Direction: store.DirectionIn}},
+		{"no chat", store.Message{TenantID: "tenant-a", WAMessageID: "w", Direction: store.DirectionIn}},
+		{"no wa message id", store.Message{TenantID: "tenant-a", ChatJID: "c", Direction: store.DirectionIn}},
+		{"bad direction", store.Message{TenantID: "tenant-a", ChatJID: "c", WAMessageID: "w", Direction: "sideways"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := db.Messages().AppendBatch(ctx, []store.Message{tc.msg}); err == nil {
+				t.Error("AppendBatch() accepted an invalid row")
+			}
+		})
+	}
+}
+
+// TestMessageOldestByChat covers the backfill anchor: on-demand history is
+// requested relative to the OLDEST message we already hold for the chat.
+func TestMessageOldestByChat(t *testing.T) {
+	db := newTestDB(t)
+	mustTenant(t, db, "tenant-a", "Acme")
+	mustTenant(t, db, "tenant-b", "Globex")
+	seedMessages(t, db)
+	ctx := context.Background()
+
+	got, err := db.Messages().OldestByChat(ctx, "tenant-a", "chat-1")
+	if err != nil {
+		t.Fatalf("OldestByChat() error = %v", err)
+	}
+	if got.ID != "m1" {
+		t.Errorf("OldestByChat() = %q, want m1 (the oldest of chat-1)", got.ID)
+	}
+
+	if _, err := db.Messages().OldestByChat(ctx, "tenant-a", "chat-unknown"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("OldestByChat() on an empty chat error = %v, want ErrNotFound", err)
+	}
+
+	// A chat another tenant owns is an empty chat as far as this tenant knows.
+	if _, err := db.Messages().OldestByChat(ctx, "tenant-b", "chat-2"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("OldestByChat() across tenants error = %v, want ErrNotFound", err)
+	}
+}
+
+// TestMessageSearchChats is the helper behind the contact lookup tool: it maps
+// a free-text query onto the chats we already store something for.
+func TestMessageSearchChats(t *testing.T) {
+	db := newTestDB(t)
+	mustTenant(t, db, "tenant-a", "Acme")
+	mustTenant(t, db, "tenant-b", "Globex")
+	seedMessages(t, db)
+	ctx := context.Background()
+
+	tests := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{"matches a chat jid", "chat-1", []string{"chat-1"}},
+		{"matches every chat of the tenant", "chat", []string{"chat-1", "chat-2"}},
+		{"matches a sender jid", "me", []string{"chat-1"}},
+		{"no match", "nobody", nil},
+		{"empty query returns nothing", "", nil},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := db.Messages().SearchChats(ctx, "tenant-a", tc.query, 0)
+			if err != nil {
+				t.Fatalf("SearchChats() error = %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("SearchChats(%q) = %v, want %v", tc.query, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("SearchChats(%q)[%d] = %q, want %q", tc.query, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestMessageSearchChatsIsTenantIsolated keeps the contact helper inside the
+// same tenant boundary as every other read.
+func TestMessageSearchChatsIsTenantIsolated(t *testing.T) {
+	db := newTestDB(t)
+	mustTenant(t, db, "tenant-a", "Acme")
+	mustTenant(t, db, "tenant-b", "Globex")
+	seedMessages(t, db)
+
+	got, err := db.Messages().SearchChats(context.Background(), "tenant-b", "chat", 0)
+	if err != nil {
+		t.Fatalf("SearchChats() error = %v", err)
+	}
+	if len(got) != 1 || got[0] != "chat-1" {
+		t.Errorf("SearchChats() for tenant-b = %v, want only its own chat-1", got)
+	}
+}

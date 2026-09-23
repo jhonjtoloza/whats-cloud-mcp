@@ -20,6 +20,30 @@ import (
 // reach it. Widening the bind is an operator decision made through BIND_ADDR.
 const defaultBindAddr = "127.0.0.1:8080"
 
+// DefaultHistorySyncTimeout bounds how long an on-demand backfill waits for the
+// phone to answer. The request travels to the user's primary device, which may
+// be asleep, so this is generous by design.
+const DefaultHistorySyncTimeout = 30 * time.Second
+
+// HistorySyncScope says which chat types a pushed history sync is stored in
+// full for.
+//
+// It is a volume control, not a privacy switch: chats outside the scope still
+// keep their most recent message, because a chat with no stored message can
+// never be used as an anchor for an on-demand backfill later.
+type HistorySyncScope string
+
+const (
+	// HistorySyncScopeDM stores direct conversations in full. It is the
+	// default, because groups and channels are where the volume is.
+	HistorySyncScopeDM HistorySyncScope = "dm"
+	// HistorySyncScopeDMGroup adds group chats.
+	HistorySyncScopeDMGroup HistorySyncScope = "dm,group"
+	// HistorySyncScopeAll adds everything else, newsletters (channels)
+	// included.
+	HistorySyncScopeAll HistorySyncScope = "all"
+)
+
 // Gateway is the configuration of the HTTP daemon.
 type Gateway struct {
 	// AdminToken guards the admin credential class. Required.
@@ -40,6 +64,12 @@ type Gateway struct {
 	LogLevel slog.Level
 	// ShutdownTimeout bounds graceful shutdown.
 	ShutdownTimeout time.Duration
+	// HistorySyncScope decides which chat types a pushed history sync is
+	// stored in full for.
+	HistorySyncScope HistorySyncScope
+	// HistorySyncTimeout bounds how long an on-demand backfill waits for the
+	// phone to answer.
+	HistorySyncTimeout time.Duration
 }
 
 // LoadGateway reads the gateway configuration from the environment.
@@ -67,7 +97,71 @@ func LoadGateway() (Gateway, error) {
 	cfg.BindAddr = bindAddr
 	cfg.Port = port
 
+	scope, err := ParseHistorySyncScope(os.Getenv("HISTORY_SYNC_SCOPE"))
+	if err != nil {
+		return Gateway{}, err
+	}
+	cfg.HistorySyncScope = scope
+
+	timeout, err := parseHistorySyncTimeout(os.Getenv("HISTORY_SYNC_TIMEOUT"))
+	if err != nil {
+		return Gateway{}, err
+	}
+	cfg.HistorySyncTimeout = timeout
+
 	return cfg, nil
+}
+
+// ParseHistorySyncScope reads HISTORY_SYNC_SCOPE.
+//
+// The three accepted values are "dm" (the default), "dm,group" and "all". The
+// parts may be reordered, spaced and cased freely, but anything outside those
+// three sets is an error rather than a silent fallback: the setting decides how
+// much of the user's history lands on disk, so a typo must not quietly change
+// it.
+func ParseHistorySyncScope(raw string) (HistorySyncScope, error) {
+	parts := splitList(strings.ToLower(raw))
+	if len(parts) == 0 {
+		return HistorySyncScopeDM, nil
+	}
+
+	// splitList already de-duplicates, so a repeated part is the same scope.
+	seen := make(map[string]bool, len(parts))
+	for _, part := range parts {
+		switch part {
+		case "dm", "group", "all":
+			seen[part] = true
+		default:
+			return "", fmt.Errorf("config: HISTORY_SYNC_SCOPE %q is not one of dm, \"dm,group\" or all", raw)
+		}
+	}
+
+	switch {
+	case len(seen) == 1 && seen["dm"]:
+		return HistorySyncScopeDM, nil
+	case len(seen) == 2 && seen["dm"] && seen["group"]:
+		return HistorySyncScopeDMGroup, nil
+	case len(seen) == 1 && seen["all"]:
+		return HistorySyncScopeAll, nil
+	default:
+		return "", fmt.Errorf("config: HISTORY_SYNC_SCOPE %q is not one of dm, \"dm,group\" or all", raw)
+	}
+}
+
+// parseHistorySyncTimeout reads HISTORY_SYNC_TIMEOUT as a Go duration.
+func parseHistorySyncTimeout(raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return DefaultHistorySyncTimeout, nil
+	}
+	timeout, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("config: HISTORY_SYNC_TIMEOUT %q is not a duration", raw)
+	}
+	if timeout <= 0 {
+		return 0, fmt.Errorf("config: HISTORY_SYNC_TIMEOUT %q must be positive", raw)
+	}
+	return timeout, nil
 }
 
 // resolveBindAddr decides where to listen.

@@ -90,8 +90,9 @@ them, which should be a deliberate act.
 5. **Every MCP tool derives its tenant from the authenticated principal**, read
    from the request context. No tool takes a tenant argument; the client must
    never be able to choose whose data it reads.
-   Guarded by `TestMCPTenantIsolation` and
-   `TestMCPToolsIgnoreClientSuppliedTenant`.
+   Guarded by `TestMCPTenantIsolation`,
+   `TestMCPToolsIgnoreClientSuppliedTenant` and
+   `TestMCPNewToolsIgnoreClientSuppliedTenant`.
 6. **The /mcp endpoint enforces scopes per tool.** One URL serves tools with
    different requirements (`messages:read` for reads, `messages:send` for
    sends), so endpoint middleware only authenticates and each tool checks for

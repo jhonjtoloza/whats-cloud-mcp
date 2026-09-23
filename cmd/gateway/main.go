@@ -112,7 +112,10 @@ func run() error {
 	logger.Info("database ready", slog.String("path", cfg.DBPath))
 
 	// whatsmeow manages its own whatsmeow_* tables inside the same file.
-	manager, err := wa.NewManager(ctx, db, logger)
+	manager, err := wa.NewManager(ctx, db, logger, wa.ManagerOptions{
+		HistoryScope:   cfg.HistorySyncScope,
+		HistoryTimeout: cfg.HistorySyncTimeout,
+	})
 	if err != nil {
 		return err
 	}

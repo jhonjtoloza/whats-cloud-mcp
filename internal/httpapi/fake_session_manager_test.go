@@ -13,8 +13,10 @@ import (
 type fakeSessionManager struct {
 	mu sync.Mutex
 
-	pairCalls []pairCall
-	sendCalls []sendCall
+	pairCalls    []pairCall
+	sendCalls    []sendCall
+	contactCalls []contactCall
+	syncCalls    []syncCall
 
 	pairResult  wa.PairingResult
 	pairErr     error
@@ -24,6 +26,10 @@ type fakeSessionManager struct {
 	sendErr     error
 	logoutCalls []string
 	logoutErr   error
+	contacts    []wa.Contact
+	contactsErr error
+	syncResult  wa.SyncResult
+	syncErr     error
 }
 
 type pairCall struct {
@@ -35,6 +41,17 @@ type sendCall struct {
 	TenantID string
 	To       string
 	Body     string
+}
+
+type contactCall struct {
+	TenantID string
+	Query    string
+}
+
+type syncCall struct {
+	TenantID string
+	ChatJID  string
+	Count    int
 }
 
 func (f *fakeSessionManager) StartPairing(_ context.Context, tenantID, phone string) (wa.PairingResult, error) {
@@ -91,6 +108,48 @@ func (f *fakeSessionManager) Logout(_ context.Context, tenantID string) error {
 
 	f.logoutCalls = append(f.logoutCalls, tenantID)
 	return f.logoutErr
+}
+
+func (f *fakeSessionManager) FindContacts(_ context.Context, tenantID, query string) ([]wa.Contact, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.contactCalls = append(f.contactCalls, contactCall{TenantID: tenantID, Query: query})
+	if f.contactsErr != nil {
+		return nil, f.contactsErr
+	}
+	return f.contacts, nil
+}
+
+func (f *fakeSessionManager) SyncHistory(_ context.Context, tenantID, chatJID string, count int) (wa.SyncResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.syncCalls = append(f.syncCalls, syncCall{TenantID: tenantID, ChatJID: chatJID, Count: count})
+	if f.syncErr != nil {
+		return wa.SyncResult{}, f.syncErr
+	}
+	result := f.syncResult
+	if result.ChatJID == "" {
+		result.ChatJID = chatJID
+	}
+	return result, nil
+}
+
+func (f *fakeSessionManager) snapshotContactCalls() []contactCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]contactCall, len(f.contactCalls))
+	copy(out, f.contactCalls)
+	return out
+}
+
+func (f *fakeSessionManager) snapshotSyncCalls() []syncCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]syncCall, len(f.syncCalls))
+	copy(out, f.syncCalls)
+	return out
 }
 
 func (f *fakeSessionManager) snapshotSends() []sendCall {

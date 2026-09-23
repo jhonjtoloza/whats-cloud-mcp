@@ -41,6 +41,27 @@ type Messages interface {
 	// Append stores a message. A repeated (tenant_id, wa_message_id) pair is a
 	// no-op, because WhatsApp redelivers messages.
 	Append(ctx context.Context, m Message) error
+	// AppendBatch stores many messages in one transaction and reports how many
+	// rows were actually new.
+	//
+	// It exists for history sync, which delivers whole conversations at once
+	// and overlaps heavily with what the live event stream already stored. The
+	// same (tenant_id, wa_message_id) uniqueness makes a replay a no-op, so the
+	// returned count is the honest "new history" number.
+	AppendBatch(ctx context.Context, messages []Message) (int, error)
+	// OldestByChat returns the oldest stored message of a chat, or ErrNotFound
+	// when the chat has none.
+	//
+	// This is the anchor an on-demand history request is built from: WhatsApp
+	// backfills the messages immediately BEFORE a known message, so a chat with
+	// nothing stored cannot be backfilled at all.
+	OldestByChat(ctx context.Context, tenantID, chatJID string) (Message, error)
+	// SearchChats returns the chat JIDs whose address or sender matches the
+	// query, most recent activity first.
+	//
+	// It answers "do we already hold messages for this contact?", which is what
+	// the contact lookup tool needs before deciding whether to backfill.
+	SearchChats(ctx context.Context, tenantID, query string, limit int) ([]string, error)
 	// ListByChat returns the most recent messages of a chat, newest first.
 	ListByChat(ctx context.Context, tenantID, chatJID string, limit int) ([]Message, error)
 	// ListChats returns conversation summaries ordered by most recent activity.

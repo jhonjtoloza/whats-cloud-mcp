@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/jhonjtoloza/whats-cloud-mcp/internal/wa"
 )
 
 // headerTransport injects the credentials an MCP client would carry.
@@ -216,7 +218,7 @@ func TestMCPEndpointValidatesOrigin(t *testing.T) {
 	}
 }
 
-func TestMCPListsTheThreeTools(t *testing.T) {
+func TestMCPListsItsTools(t *testing.T) {
 	env := newTestEnv(t)
 	tenant := env.createTenant(t, "Acme", []string{"messages:read", "messages:send"})
 	session := connectMCP(t, env, tenant.APIKey.Key, "")
@@ -236,7 +238,7 @@ func TestMCPListsTheThreeTools(t *testing.T) {
 			t.Errorf("tool %q has no input schema; AddTool should generate one", tool.Name)
 		}
 	}
-	for _, want := range []string{"list_chats", "list_messages", "send_message"} {
+	for _, want := range []string{"list_chats", "list_messages", "send_message", "find_contact", "sync_history"} {
 		if !got[want] {
 			t.Errorf("tool %q is missing; got %v", want, got)
 		}
@@ -367,6 +369,36 @@ func TestMCPEnforcesScopePerTool(t *testing.T) {
 			args:    map[string]any{},
 			wantErr: false,
 		},
+		{
+			name:       "send-only key cannot look up contacts",
+			scopes:     []string{"messages:send"},
+			tool:       "find_contact",
+			args:       map[string]any{"query": "ana"},
+			wantErr:    true,
+			wantReason: "messages:read",
+		},
+		{
+			name:       "send-only key cannot backfill history",
+			scopes:     []string{"messages:send"},
+			tool:       "sync_history",
+			args:       map[string]any{"chat_jid": "x@s.whatsapp.net"},
+			wantErr:    true,
+			wantReason: "messages:read",
+		},
+		{
+			name:    "read key may look up contacts",
+			scopes:  []string{"messages:read"},
+			tool:    "find_contact",
+			args:    map[string]any{"query": "ana"},
+			wantErr: false,
+		},
+		{
+			name:    "read key may backfill history",
+			scopes:  []string{"messages:read"},
+			tool:    "sync_history",
+			args:    map[string]any{"chat_jid": "x@s.whatsapp.net"},
+			wantErr: false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -476,5 +508,174 @@ func TestMCPToolsIgnoreClientSuppliedTenant(t *testing.T) {
 	}
 	if strings.Contains(resultText(t, res), "message for globex") {
 		t.Fatal("a client-supplied tenant_id redirected the read")
+	}
+}
+
+type mcpContacts struct {
+	Contacts []struct {
+		JID         string `json:"jid"`
+		Name        string `json:"name"`
+		HasMessages bool   `json:"has_messages"`
+	} `json:"contacts"`
+}
+
+type mcpSyncResult struct {
+	ChatJID         string `json:"chat_jid"`
+	Inserted        int    `json:"inserted"`
+	OldestTimestamp string `json:"oldest_timestamp"`
+	MoreAvailable   bool   `json:"more_available"`
+}
+
+func TestMCPFindContact(t *testing.T) {
+	env := newTestEnv(t)
+	tenant := env.createTenant(t, "Acme", []string{"messages:read"})
+	env.sessions.contacts = []wa.Contact{
+		{JID: "573001234567@s.whatsapp.net", Name: "Ana Torres", HasMessages: true},
+	}
+
+	session := connectMCP(t, env, tenant.APIKey.Key, "")
+	out := structured[mcpContacts](t, callTool(t, session, "find_contact", map[string]any{"query": "ana"}))
+
+	if len(out.Contacts) != 1 {
+		t.Fatalf("find_contact returned %d contacts, want 1", len(out.Contacts))
+	}
+	if out.Contacts[0].JID != "573001234567@s.whatsapp.net" || !out.Contacts[0].HasMessages {
+		t.Errorf("contact = %+v", out.Contacts[0])
+	}
+
+	calls := env.sessions.snapshotContactCalls()
+	if len(calls) != 1 || calls[0].TenantID != tenant.TenantID {
+		t.Errorf("FindContacts calls = %+v, want one for the authenticated tenant", calls)
+	}
+}
+
+func TestMCPSyncHistory(t *testing.T) {
+	env := newTestEnv(t)
+	tenant := env.createTenant(t, "Acme", []string{"messages:read"})
+	env.sessions.syncResult = wa.SyncResult{
+		Inserted:        12,
+		OldestTimestamp: time.Date(2025, 11, 2, 7, 30, 0, 0, time.UTC),
+		MoreAvailable:   true,
+	}
+
+	session := connectMCP(t, env, tenant.APIKey.Key, "")
+	out := structured[mcpSyncResult](t, callTool(t, session, "sync_history", map[string]any{
+		"chat_jid": "573001234567@s.whatsapp.net",
+		"count":    75,
+	}))
+
+	if out.Inserted != 12 {
+		t.Errorf("inserted = %d, want 12", out.Inserted)
+	}
+	if out.OldestTimestamp != "2025-11-02T07:30:00Z" {
+		t.Errorf("oldest_timestamp = %q", out.OldestTimestamp)
+	}
+	if !out.MoreAvailable {
+		t.Error("more_available = false, want true")
+	}
+
+	calls := env.sessions.snapshotSyncCalls()
+	if len(calls) != 1 {
+		t.Fatalf("SyncHistory called %d times, want 1", len(calls))
+	}
+	if calls[0].Count != 75 {
+		t.Errorf("count = %d, want 75", calls[0].Count)
+	}
+	if calls[0].TenantID != tenant.TenantID {
+		t.Errorf("backfilled as tenant %q, want %q", calls[0].TenantID, tenant.TenantID)
+	}
+}
+
+// TestMCPSyncHistoryWithoutAnAnchor checks the model is told WHY the backfill
+// cannot happen, since the fix ("get a message into that chat first") is not
+// something it could guess from a generic failure.
+func TestMCPSyncHistoryWithoutAnAnchor(t *testing.T) {
+	env := newTestEnv(t)
+	tenant := env.createTenant(t, "Acme", []string{"messages:read"})
+	env.sessions.syncErr = wa.ErrNoAnchorMessage
+
+	session := connectMCP(t, env, tenant.APIKey.Key, "")
+	res := callTool(t, session, "sync_history", map[string]any{"chat_jid": "573001234567@s.whatsapp.net"})
+
+	if !res.IsError {
+		t.Fatal("sync_history without an anchor should be a tool error")
+	}
+	text := strings.ToLower(resultText(t, res))
+	if !strings.Contains(text, "anchor") {
+		t.Errorf("error %q should explain the missing anchor", text)
+	}
+}
+
+// TestMCPNewToolsIgnoreClientSuppliedTenant extends the guarantee of
+// TestMCPToolsIgnoreClientSuppliedTenant to the backfill tools: neither takes a
+// tenant, so neither can be pointed at somebody else's data.
+func TestMCPNewToolsIgnoreClientSuppliedTenant(t *testing.T) {
+	tests := []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{"find_contact", "find_contact", map[string]any{"query": "ana"}},
+		{"sync_history", "sync_history", map[string]any{"chat_jid": "573001234567@s.whatsapp.net"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newTestEnv(t)
+			tenantA := env.createTenant(t, "Acme", []string{"messages:read"})
+			tenantB := env.createTenant(t, "Globex", []string{"messages:read"})
+
+			session := connectMCP(t, env, tenantA.APIKey.Key, "")
+
+			args := map[string]any{"tenant_id": tenantB.TenantID}
+			for k, v := range tc.args {
+				args[k] = v
+			}
+			callTool(t, session, tc.tool, args)
+
+			var tenants []string
+			for _, call := range env.sessions.snapshotContactCalls() {
+				tenants = append(tenants, call.TenantID)
+			}
+			for _, call := range env.sessions.snapshotSyncCalls() {
+				tenants = append(tenants, call.TenantID)
+			}
+			for _, tenantID := range tenants {
+				if tenantID != tenantA.TenantID {
+					t.Errorf("a client-supplied tenant_id redirected %s to tenant %q", tc.tool, tenantID)
+				}
+			}
+		})
+	}
+}
+
+// TestMCPToolDescriptionsExplainTheSequence keeps the tools usable by a model
+// that has never seen this gateway: the descriptions have to say how the three
+// steps fit together, and that a backfill needs an anchor.
+func TestMCPToolDescriptionsExplainTheSequence(t *testing.T) {
+	env := newTestEnv(t)
+	tenant := env.createTenant(t, "Acme", []string{"messages:read"})
+	session := connectMCP(t, env, tenant.APIKey.Key, "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	res, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools() error = %v", err)
+	}
+
+	descriptions := make(map[string]string, len(res.Tools))
+	for _, tool := range res.Tools {
+		descriptions[tool.Name] = strings.ToLower(tool.Description)
+	}
+
+	if !strings.Contains(descriptions["find_contact"], "sync_history") {
+		t.Errorf("find_contact description does not point at the next step: %q", descriptions["find_contact"])
+	}
+	for _, want := range []string{"anchor", "list_messages"} {
+		if !strings.Contains(descriptions["sync_history"], want) {
+			t.Errorf("sync_history description does not mention %q: %q", want, descriptions["sync_history"])
+		}
 	}
 }

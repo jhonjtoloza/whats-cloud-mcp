@@ -8,6 +8,7 @@ package wa
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // Common failures the HTTP layer maps onto status codes.
@@ -18,7 +19,64 @@ var (
 	ErrUnknownTenant = errors.New("wa: unknown tenant")
 	// ErrInvalidJID means the destination could not be parsed.
 	ErrInvalidJID = errors.New("wa: invalid jid")
+	// ErrNoAnchorMessage means the chat has no stored message to backfill from.
+	//
+	// This is a real constraint of WhatsApp's on-demand history, not a gap in
+	// this gateway: the request asks for the messages immediately BEFORE a
+	// message the phone can identify, so a conversation we hold nothing for
+	// cannot be addressed at all. The chat has to show up in a pushed history
+	// sync, or receive a live message, before it can be backfilled.
+	ErrNoAnchorMessage = errors.New("wa: the chat has no stored message to anchor a history request; it must appear in a pushed history sync or receive a message first")
+	// ErrSyncInProgress means another backfill of the same chat is still
+	// waiting for its reply.
+	ErrSyncInProgress = errors.New("wa: a history sync for this chat is already in progress")
+	// ErrSyncTimeout means the phone did not answer the history request in
+	// time. The request may still be answered later, and the messages will be
+	// stored when it is.
+	ErrSyncTimeout = errors.New("wa: timed out waiting for the phone to answer the history request")
 )
+
+// Sync request sizing. WhatsApp recommends asking for 50 messages at a time;
+// the maximum is ours, to keep one call from pulling an unbounded chunk.
+const (
+	// DefaultSyncCount is used when a caller asks for no particular number.
+	DefaultSyncCount = 50
+	// MaxSyncCount caps a single backfill request.
+	MaxSyncCount = 200
+)
+
+// NormalizeSyncCount clamps a requested backfill size into the supported range.
+func NormalizeSyncCount(count int) int {
+	switch {
+	case count <= 0:
+		return DefaultSyncCount
+	case count > MaxSyncCount:
+		return MaxSyncCount
+	default:
+		return count
+	}
+}
+
+// Contact is a candidate destination resolved from the tenant's address book.
+type Contact struct {
+	JID  string `json:"jid"`
+	Name string `json:"name"`
+	// HasMessages says whether the gateway already stores messages for this
+	// chat. It is what tells a caller whether it can read the conversation
+	// straight away or has to backfill it first.
+	HasMessages bool `json:"has_messages"`
+}
+
+// SyncResult reports what an on-demand backfill brought in.
+type SyncResult struct {
+	ChatJID  string `json:"chat_jid"`
+	Inserted int    `json:"inserted"`
+	// OldestTimestamp is the timestamp of the oldest message now stored for the
+	// chat, which is where the next backfill would continue from.
+	OldestTimestamp time.Time `json:"oldest_timestamp"`
+	// MoreAvailable says whether asking again is likely to yield more history.
+	MoreAvailable bool `json:"more_available"`
+}
 
 // PairingMode says which of the two pairing flows produced a result.
 type PairingMode string
@@ -63,4 +121,13 @@ type SessionManager interface {
 	SendText(ctx context.Context, tenantID, toJID, body string) (string, error)
 	// Logout unlinks the tenant's device and drops the client.
 	Logout(ctx context.Context, tenantID string) error
+	// FindContacts resolves a free-text query against the tenant's address
+	// book, reporting for each candidate whether messages are already stored.
+	FindContacts(ctx context.Context, tenantID, query string) ([]Contact, error)
+	// SyncHistory asks the phone for the messages preceding the oldest message
+	// stored for a chat, waits for them, and reports what landed.
+	//
+	// It returns ErrNoAnchorMessage when the chat has nothing stored to anchor
+	// the request on.
+	SyncHistory(ctx context.Context, tenantID, chatJID string, count int) (SyncResult, error)
 }

@@ -106,6 +106,8 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("POST /v1/messages", scope(auth.ScopeMessagesSend)(http.HandlerFunc(s.handleSendMessage)))
 	mux.Handle("GET /v1/chats", scope(auth.ScopeMessagesRead)(http.HandlerFunc(s.handleListChats)))
 	mux.Handle("GET /v1/chats/{jid}/messages", scope(auth.ScopeMessagesRead)(http.HandlerFunc(s.handleListChatMessages)))
+	mux.Handle("POST /v1/chats/{jid}/sync", scope(auth.ScopeMessagesRead)(http.HandlerFunc(s.handleSyncChatHistory)))
+	mux.Handle("GET /v1/contacts", scope(auth.ScopeMessagesRead)(http.HandlerFunc(s.handleFindContacts)))
 
 	// MCP over Streamable HTTP, in this same process.
 	//

@@ -26,6 +26,8 @@ hop, no second credential, no second container.
   │   /v1/… REST routes          │   /mcp  list_chats          │
   │                              │         list_messages       │
   │                              │         send_message        │
+  │                              │         find_contact        │
+  │                              │         sync_history        │
   ├──────────────────────────────┴─────────────────────────────┤
   │ internal/auth    keys, scopes, middleware                  │
   │ internal/wa      whatsmeow, one client per tenant          │
@@ -108,6 +110,8 @@ number never invalidates or rotates an API key.** It is asserted by
 | `POST` | `/v1/messages` | `messages:send` | `{to, body}` |
 | `GET` | `/v1/chats` | `messages:read` | `?limit=` |
 | `GET` | `/v1/chats/{jid}/messages` | `messages:read` | `?limit=`, newest first |
+| `POST` | `/v1/chats/{jid}/sync` | `messages:read` | `{count?}` (default 50, max 200); backfills older history |
+| `GET` | `/v1/contacts` | `messages:read` | `?q=` name, business name or phone number |
 | `POST` | `/mcp` | tenant key | MCP over Streamable HTTP |
 
 Errors always share one shape:
@@ -118,16 +122,23 @@ Errors always share one shape:
 
 ## MCP
 
-Three tools, served at `/mcp`:
+Five tools, served at `/mcp`:
 
 | Tool | Arguments | Required scope |
 |---|---|---|
 | `list_chats` | `limit?` | `messages:read` |
 | `list_messages` | `chat_jid`, `limit?` | `messages:read` |
 | `send_message` | `to`, `body` | `messages:send` |
+| `find_contact` | `query` | `messages:read` |
+| `sync_history` | `chat_jid`, `count?` | `messages:read` |
+
+The intended reading sequence is `find_contact` → `list_messages` → and, when
+the stored conversation is missing or too shallow, `sync_history` followed by
+`list_messages` again. The tool descriptions say so, because a model has no
+other way to learn it.
 
 The endpoint authenticates the tenant, but it cannot enforce a single scope
-because the three tools differ — so **each tool checks its own scope** against
+because the tools differ — so **each tool checks its own scope** against
 the authenticated principal and returns a tool error when it is missing. No
 tool accepts a tenant identifier: the tenant always comes from the API key.
 
@@ -259,6 +270,38 @@ an `httptest` server, rather than calling the tool functions directly.
 The whatsmeow-backed `wa.Manager` has no unit tests on purpose — every
 meaningful path needs a live socket — so `httpapi` and MCP tests run against a
 `fakeSessionManager` behind the `wa.SessionManager` interface.
+
+## History sync
+
+WhatsApp pushes a chunk of past conversation to a newly linked device, and it
+will send more on request. The gateway stores both.
+
+**Pushed history** arrives as an event and is filtered by `HISTORY_SYNC_SCOPE`:
+
+| Value | Stored in full |
+|---|---|
+| `dm` (default) | direct conversations |
+| `dm,group` | direct conversations and groups |
+| `all` | everything, channels included |
+
+The scope is a volume control, not a filter on existence. A chat type outside
+the scope still keeps its **most recent message**, because backfilling on
+demand asks WhatsApp for the messages immediately *before* a message it can
+identify: a conversation with nothing stored has no anchor and could never be
+backfilled afterwards. Two things are skipped outright — status updates, which
+expire in 24 hours and are not a conversation, and channels (`newsletter`)
+unless the scope is `all`.
+
+**On-demand backfill** is `POST /v1/chats/{jid}/sync` and the `sync_history`
+tool. It loads the oldest message stored for the chat, asks the phone for what
+came before it, waits for the reply (`HISTORY_SYNC_TIMEOUT`, 30s by default)
+and reports how many messages were new. A chat with no stored message is
+rejected with a `409` naming the missing anchor rather than a generic failure:
+it is a constraint of WhatsApp's protocol, and the caller needs to know the fix
+is to get a message into that chat first.
+
+Both paths write through the same unique `(tenant_id, wa_message_id)` index, so
+history and the live stream can never duplicate each other.
 
 ## Notes on search
 

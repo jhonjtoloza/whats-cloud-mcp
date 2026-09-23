@@ -62,6 +62,21 @@ func writeWAError(w http.ResponseWriter, err error) bool {
 	case errors.Is(err, wa.ErrInvalidJID):
 		apierr.InvalidRequest(w, "the destination is not a valid WhatsApp JID")
 		return true
+	case errors.Is(err, wa.ErrNoAnchorMessage):
+		// Not a server fault and not a retryable one: the chat needs a stored
+		// message to anchor the request, so the caller has to be told what is
+		// missing rather than handed a generic failure.
+		apierr.Write(w, http.StatusConflict, apierr.CodeConflict,
+			"this chat has no stored message to anchor a history request; it must appear in a pushed history sync or receive a message first")
+		return true
+	case errors.Is(err, wa.ErrSyncInProgress):
+		apierr.Write(w, http.StatusConflict, apierr.CodeConflict,
+			"a history sync for this chat is already running")
+		return true
+	case errors.Is(err, wa.ErrSyncTimeout):
+		apierr.Write(w, http.StatusGatewayTimeout, apierr.CodeUnavailable,
+			"the phone did not answer the history request in time; it may still arrive, so try reading the chat again shortly")
+		return true
 	default:
 		return false
 	}

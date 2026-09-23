@@ -4,17 +4,21 @@ import (
 	"log/slog"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/jhonjtoloza/whats-cloud-mcp/internal/config"
 )
 
-// clearBindEnv removes every binding-related variable so a test starts from a
-// known state regardless of what the developer has exported.
+// clearBindEnv removes every variable LoadGateway reads beyond the admin token,
+// so a test starts from a known state regardless of what the developer has
+// exported.
 func clearBindEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("BIND_ADDR", "")
 	t.Setenv("PORT", "")
 	t.Setenv("MCP_ALLOWED_ORIGINS", "")
+	t.Setenv("HISTORY_SYNC_SCOPE", "")
+	t.Setenv("HISTORY_SYNC_TIMEOUT", "")
 }
 
 func TestLoadGatewayDefaults(t *testing.T) {
@@ -183,6 +187,91 @@ func TestParseLogLevel(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := config.ParseLogLevel(tc.value); got != tc.want {
 				t.Errorf("ParseLogLevel(%q) = %v, want %v", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseHistorySyncScope pins the only three scopes the gateway accepts.
+//
+// An unknown value fails loudly instead of falling back to a default: history
+// sync decides how much of a user's past conversation is written to disk, and
+// silently widening or narrowing that because of a typo would be the wrong kind
+// of surprise.
+func TestParseHistorySyncScope(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    config.HistorySyncScope
+		wantErr bool
+	}{
+		{"empty defaults to direct messages only", "", config.HistorySyncScopeDM, false},
+		{"dm", "dm", config.HistorySyncScopeDM, false},
+		{"dm and group", "dm,group", config.HistorySyncScopeDMGroup, false},
+		{"order does not matter", "group,dm", config.HistorySyncScopeDMGroup, false},
+		{"whitespace is trimmed", " dm , group ", config.HistorySyncScopeDMGroup, false},
+		{"uppercase is accepted", "DM,GROUP", config.HistorySyncScopeDMGroup, false},
+		{"all", "all", config.HistorySyncScopeAll, false},
+		{"unknown value is rejected", "everything", "", true},
+		{"group alone is not one of the three scopes", "group", "", true},
+		{"all cannot be combined", "all,dm", "", true},
+		// splitList de-duplicates, exactly as it does for the origin
+		// allowlist, so a repeated part is the same scope rather than an error.
+		{"repeated value is tolerated", "dm,dm", config.HistorySyncScopeDM, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := config.ParseHistorySyncScope(tc.raw)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("ParseHistorySyncScope(%q) error = %v, wantErr %v", tc.raw, err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if got != tc.want {
+				t.Errorf("ParseHistorySyncScope(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadGatewayHistorySync(t *testing.T) {
+	tests := []struct {
+		name        string
+		scope       string
+		timeout     string
+		wantScope   config.HistorySyncScope
+		wantTimeout time.Duration
+		wantErr     bool
+	}{
+		{"defaults", "", "", config.HistorySyncScopeDM, 30 * time.Second, false},
+		{"explicit scope", "all", "", config.HistorySyncScopeAll, 30 * time.Second, false},
+		{"explicit timeout", "", "45s", config.HistorySyncScopeDM, 45 * time.Second, false},
+		{"invalid scope fails startup", "everything", "", "", 0, true},
+		{"invalid timeout fails startup", "", "soon", "", 0, true},
+		{"non positive timeout fails startup", "", "0s", "", 0, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clearBindEnv(t)
+			t.Setenv("ADMIN_TOKEN", "a-token")
+			t.Setenv("HISTORY_SYNC_SCOPE", tc.scope)
+			t.Setenv("HISTORY_SYNC_TIMEOUT", tc.timeout)
+
+			got, err := config.LoadGateway()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("LoadGateway() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if got.HistorySyncScope != tc.wantScope {
+				t.Errorf("HistorySyncScope = %q, want %q", got.HistorySyncScope, tc.wantScope)
+			}
+			if got.HistorySyncTimeout != tc.wantTimeout {
+				t.Errorf("HistorySyncTimeout = %v, want %v", got.HistorySyncTimeout, tc.wantTimeout)
 			}
 		})
 	}

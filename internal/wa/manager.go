@@ -19,6 +19,7 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/jhonjtoloza/whats-cloud-mcp/internal/config"
 	"github.com/jhonjtoloza/whats-cloud-mcp/internal/store"
 )
 
@@ -48,15 +49,36 @@ type Manager struct {
 	logger    *slog.Logger
 	waLogger  waLog.Logger
 
+	historyScope   config.HistorySyncScope
+	historyTimeout time.Duration
+	pending        *pendingHistory
+
 	mu      sync.RWMutex
 	clients map[string]*whatsmeow.Client
 }
 
+// ManagerOptions carries the history-sync settings the gateway was started
+// with. The zero value is the safe one: direct messages only, and the default
+// backfill timeout.
+type ManagerOptions struct {
+	// HistoryScope decides which chat types a pushed history sync is stored in
+	// full for.
+	HistoryScope config.HistorySyncScope
+	// HistoryTimeout bounds how long SyncHistory waits for the phone.
+	HistoryTimeout time.Duration
+}
+
 // NewManager builds a Manager on top of the gateway's own database handle, so
 // whatsmeow's schema lives in the very same SQLite file.
-func NewManager(ctx context.Context, db *store.DB, logger *slog.Logger) (*Manager, error) {
+func NewManager(ctx context.Context, db *store.DB, logger *slog.Logger, opts ManagerOptions) (*Manager, error) {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if opts.HistoryScope == "" {
+		opts.HistoryScope = config.HistorySyncScopeDM
+	}
+	if opts.HistoryTimeout <= 0 {
+		opts.HistoryTimeout = config.DefaultHistorySyncTimeout
 	}
 
 	// dbutil recognises any dialect starting with "sqlite"; the driver itself
@@ -67,12 +89,15 @@ func NewManager(ctx context.Context, db *store.DB, logger *slog.Logger) (*Manage
 	}
 
 	return &Manager{
-		container: container,
-		sessions:  db.Sessions(),
-		messages:  db.Messages(),
-		logger:    logger,
-		waLogger:  waLog.Noop,
-		clients:   make(map[string]*whatsmeow.Client),
+		container:      container,
+		sessions:       db.Sessions(),
+		messages:       db.Messages(),
+		logger:         logger,
+		waLogger:       waLog.Noop,
+		historyScope:   opts.HistoryScope,
+		historyTimeout: opts.HistoryTimeout,
+		pending:        newPendingHistory(),
+		clients:        make(map[string]*whatsmeow.Client),
 	}, nil
 }
 
@@ -348,12 +373,22 @@ func (m *Manager) newClient(tenantID string, device *waStore.Device) *whatsmeow.
 // handleEvent persists inbound messages and mirrors connection events onto the
 // sessions table. It never touches api_keys.
 func (m *Manager) handleEvent(tenantID string, evt any) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// A history sync is the one event that can carry thousands of messages, so
+	// it gets a deadline of its own rather than the one a single message needs.
+	timeout := 10 * time.Second
+	if _, isHistory := evt.(*events.HistorySync); isHistory {
+		timeout = historySyncPersistTimeout
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	switch e := evt.(type) {
 	case *events.Message:
 		m.persistInbound(ctx, tenantID, e)
+
+	case *events.HistorySync:
+		m.persistHistorySync(ctx, tenantID, e)
 
 	case *events.Connected:
 		waJID := ""

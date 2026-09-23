@@ -20,17 +20,25 @@ type messageRepo struct{ db *sql.DB }
 
 const messageColumns = `id, tenant_id, chat_jid, sender_jid, wa_message_id, direction, body, media_type, media_path, timestamp, created_at`
 
-// Append stores a message, ignoring a redelivery of the same wa_message_id.
-func (r *messageRepo) Append(ctx context.Context, m Message) error {
+// insertMessage is the single INSERT both Append and AppendBatch run. The
+// conflict clause is what makes a redelivery — by the live stream or by a
+// history sync — a no-op.
+const insertMessage = `INSERT INTO messages (` + messageColumns + `)
+	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	 ON CONFLICT (tenant_id, wa_message_id) DO NOTHING`
+
+// prepareMessage validates a message and fills in the fields a caller may leave
+// to the repository.
+func prepareMessage(m Message) (Message, error) {
 	switch {
 	case m.TenantID == "":
-		return errors.New("store: message tenant id is required")
+		return Message{}, errors.New("store: message tenant id is required")
 	case m.ChatJID == "":
-		return errors.New("store: message chat jid is required")
+		return Message{}, errors.New("store: message chat jid is required")
 	case m.WAMessageID == "":
-		return errors.New("store: message wa_message_id is required")
+		return Message{}, errors.New("store: message wa_message_id is required")
 	case !m.Direction.Valid():
-		return fmt.Errorf("store: invalid message direction %q", string(m.Direction))
+		return Message{}, fmt.Errorf("store: invalid message direction %q", string(m.Direction))
 	}
 	if m.ID == "" {
 		m.ID = NewID()
@@ -41,17 +49,138 @@ func (r *messageRepo) Append(ctx context.Context, m Message) error {
 	if m.CreatedAt.IsZero() {
 		m.CreatedAt = time.Now().UTC()
 	}
+	return m, nil
+}
 
-	_, err := r.db.ExecContext(ctx,
-		`INSERT INTO messages (`+messageColumns+`)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT (tenant_id, wa_message_id) DO NOTHING`,
+// messageArgs lays a message out in the order insertMessage expects.
+func messageArgs(m Message) []any {
+	return []any{
 		m.ID, m.TenantID, m.ChatJID, m.SenderJID, m.WAMessageID, string(m.Direction),
-		m.Body, m.MediaType, m.MediaPath, m.Timestamp.UTC(), m.CreatedAt.UTC())
+		m.Body, m.MediaType, m.MediaPath, m.Timestamp.UTC(), m.CreatedAt.UTC(),
+	}
+}
+
+// Append stores a message, ignoring a redelivery of the same wa_message_id.
+func (r *messageRepo) Append(ctx context.Context, m Message) error {
+	m, err := prepareMessage(m)
 	if err != nil {
+		return err
+	}
+
+	if _, err := r.db.ExecContext(ctx, insertMessage, messageArgs(m)...); err != nil {
 		return fmt.Errorf("store: append message: %w", err)
 	}
 	return nil
+}
+
+// AppendBatch stores many messages in one transaction and reports how many rows
+// were new.
+//
+// Every row is validated before anything is written, so a malformed message in
+// the middle of a history chunk cannot leave half a conversation stored.
+func (r *messageRepo) AppendBatch(ctx context.Context, messages []Message) (int, error) {
+	if len(messages) == 0 {
+		return 0, nil
+	}
+
+	prepared := make([]Message, 0, len(messages))
+	for i, m := range messages {
+		ready, err := prepareMessage(m)
+		if err != nil {
+			return 0, fmt.Errorf("store: append batch: message %d: %w", i, err)
+		}
+		prepared = append(prepared, ready)
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("store: begin message batch: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.PrepareContext(ctx, insertMessage)
+	if err != nil {
+		return 0, fmt.Errorf("store: prepare message batch: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+
+	inserted := 0
+	for _, m := range prepared {
+		res, err := stmt.ExecContext(ctx, messageArgs(m)...)
+		if err != nil {
+			return 0, fmt.Errorf("store: append batch: %w", err)
+		}
+		// DO NOTHING reports zero affected rows for a message we already hold,
+		// which is exactly the "new history" count callers want.
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("store: append batch: %w", err)
+		}
+		inserted += int(affected)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("store: commit message batch: %w", err)
+	}
+	return inserted, nil
+}
+
+// OldestByChat returns the oldest stored message of a chat.
+func (r *messageRepo) OldestByChat(ctx context.Context, tenantID, chatJID string) (Message, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT `+messageColumns+`
+		 FROM messages
+		 WHERE tenant_id = ? AND chat_jid = ?
+		 ORDER BY timestamp ASC, id ASC
+		 LIMIT 1`,
+		tenantID, chatJID)
+	if err != nil {
+		return Message{}, fmt.Errorf("store: oldest message: %w", err)
+	}
+	found, err := collectMessages(rows)
+	if err != nil {
+		return Message{}, err
+	}
+	if len(found) == 0 {
+		return Message{}, ErrNotFound
+	}
+	return found[0], nil
+}
+
+// SearchChats returns the chats whose address or sender matches the query.
+//
+// Like Search, this is a LIKE scan rather than FTS5, for the reason documented
+// on the Messages interface.
+func (r *messageRepo) SearchChats(ctx context.Context, tenantID, query string, limit int) ([]string, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, nil
+	}
+	pattern := "%" + escapeLike(query) + "%"
+
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT chat_jid
+		 FROM messages
+		 WHERE tenant_id = ?
+		   AND (chat_jid LIKE ? ESCAPE '\' OR sender_jid LIKE ? ESCAPE '\')
+		 GROUP BY chat_jid
+		 ORDER BY max(timestamp) DESC, chat_jid ASC
+		 LIMIT ?`,
+		tenantID, pattern, pattern, normalizeLimit(limit))
+	if err != nil {
+		return nil, fmt.Errorf("store: search chats: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []string
+	for rows.Next() {
+		var chatJID string
+		if err := rows.Scan(&chatJID); err != nil {
+			return nil, fmt.Errorf("store: scan chat jid: %w", err)
+		}
+		out = append(out, chatJID)
+	}
+	return out, rows.Err()
 }
 
 func (r *messageRepo) ListByChat(ctx context.Context, tenantID, chatJID string, limit int) ([]Message, error) {

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"github.com/jhonjtoloza/whats-cloud-mcp/internal/apierr"
 	"github.com/jhonjtoloza/whats-cloud-mcp/internal/auth"
 	"github.com/jhonjtoloza/whats-cloud-mcp/internal/store"
+	"github.com/jhonjtoloza/whats-cloud-mcp/internal/wa"
 )
 
 // handleGetSession reports the status of the caller's own session. The tenant
@@ -183,4 +185,93 @@ func (s *Server) handleListChatMessages(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusOK, listMessagesResponse{ChatJID: chatJID, Messages: messages})
+}
+
+type syncHistoryRequest struct {
+	Count int `json:"count"`
+}
+
+// handleSyncChatHistory asks the tenant's phone for older messages of one chat.
+//
+// The call blocks until the phone answers or the configured timeout passes,
+// because the messages are only useful once they are stored: returning early
+// would hand the caller a promise it cannot check.
+func (s *Server) handleSyncChatHistory(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	principal, ok := auth.PrincipalFrom(ctx)
+	if !ok {
+		apierr.Unauthorized(w, "api key required")
+		return
+	}
+
+	chatJID := strings.TrimSpace(r.PathValue("jid"))
+	if chatJID == "" {
+		apierr.InvalidRequest(w, "a chat jid is required")
+		return
+	}
+
+	// The body is optional: a bare POST means "the default number of messages".
+	var req syncHistoryRequest
+	if err := decodeJSON(w, r, &req); err != nil && !errors.Is(err, errEmptyBody) {
+		apierr.InvalidRequest(w, "the request body must be a JSON object")
+		return
+	}
+
+	result, err := s.sessions.SyncHistory(ctx, principal.TenantID, chatJID, wa.NormalizeSyncCount(req.Count))
+	if err != nil {
+		if writeWAError(w, err) {
+			return
+		}
+		s.logger.ErrorContext(ctx, "could not sync chat history",
+			slog.String("tenant_id", principal.TenantID),
+			slog.String("chat_jid", chatJID),
+			slog.String("error", err.Error()))
+		apierr.Internal(w)
+		return
+	}
+
+	s.logger.InfoContext(ctx, "chat history synced",
+		slog.String("tenant_id", principal.TenantID),
+		slog.String("chat_jid", chatJID),
+		slog.Int("inserted", result.Inserted))
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+type findContactsResponse struct {
+	Contacts []wa.Contact `json:"contacts"`
+}
+
+// handleFindContacts resolves a query against the caller's own address book.
+func (s *Server) handleFindContacts(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	principal, ok := auth.PrincipalFrom(ctx)
+	if !ok {
+		apierr.Unauthorized(w, "api key required")
+		return
+	}
+
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" {
+		apierr.InvalidRequest(w, "q is required")
+		return
+	}
+
+	contacts, err := s.sessions.FindContacts(ctx, principal.TenantID, query)
+	if err != nil {
+		if writeWAError(w, err) {
+			return
+		}
+		s.logger.ErrorContext(ctx, "could not look up contacts",
+			slog.String("tenant_id", principal.TenantID), slog.String("error", err.Error()))
+		apierr.Internal(w)
+		return
+	}
+	if contacts == nil {
+		contacts = []wa.Contact{}
+	}
+
+	writeJSON(w, http.StatusOK, findContactsResponse{Contacts: contacts})
 }
