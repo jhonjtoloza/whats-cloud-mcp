@@ -1,0 +1,15 @@
+# Local development override: build the image from this working tree instead of
+# pulling the published one.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#
+# Everything else — ports, environment, volume, limits, healthcheck, logging —
+# comes from docker-compose.yml and is deliberately not repeated here.
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Overrides the `always` of the base file: there is nothing to pull, the
+    # image is the one we just built.
+    pull_policy: build

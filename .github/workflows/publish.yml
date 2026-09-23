@@ -1,0 +1,94 @@
+name: publish
+
+# Builds the multi-arch container image and publishes it to GitHub Container
+# Registry. The deployment box is small and shared with other projects, so it
+# never builds anything itself — it only pulls what this workflow produced.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  # Everything below runs on the built-in GITHUB_TOKEN: no personal access
+  # token, no repository secret to rotate, nothing to leak.
+  contents: read
+  packages: write
+
+concurrency:
+  # A second push to main should supersede the first, not race it to the
+  # `latest` tag. Tag builds are never cancelled: each one is a release.
+  group: publish-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tests run before the image exists, not after it ships. A green build is
+      # the precondition for there being anything to pull.
+      - uses: actions/setup-go@v5
+        with:
+          # Single source of truth: go.mod already pins the toolchain
+          # (whatsmeow requires Go >= 1.26.0).
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        # The race detector needs cgo, so CGO_ENABLED is deliberately left at
+        # its default here. The shipped binary is still built with
+        # CGO_ENABLED=0 inside the Dockerfile.
+        run: go test -race ./...
+
+      # Multi-platform builds need buildx. QEMU is deliberately NOT installed:
+      # the builder stage runs on the native runner and Go cross-compiles, and
+      # the distroless final stage only copies a file, so nothing ever needs to
+      # be emulated. See the comment in the Dockerfile.
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # `latest` only ever moves on the default branch.
+            type=raw,value=latest,enable={{is_default_branch}}
+            # v1.4.2 -> 1.4.2 and 1.4, on tag pushes only.
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            # Always present, and the only immutable handle: sha-1a2b3c4.
+            type=sha,format=short,prefix=sha-
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          # A manual run is a dry run: it builds both architectures to prove
+          # the Dockerfile still works, and publishes nothing. Only pushes to
+          # main and to v* tags produce an image in the registry.
+          push: ${{ github.event_name != 'workflow_dispatch' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Layer cache lives in the Actions cache, so dependency downloads
+          # survive between runs. mode=max keeps the builder stage too, which
+          # is the expensive half.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

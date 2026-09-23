@@ -239,7 +239,14 @@ curl -sX POST localhost:8080/v1/messages \
 
 ```sh
 cp env.example .env          # ADMIN_TOKEN is required
-docker compose up -d --build
+docker compose up -d         # pulls ghcr.io/jhonjtoloza/whats-cloud-mcp:latest
+```
+
+To build from this working tree instead of pulling, add the development
+override (see [Deployment](#deployment)):
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
 One service, one named volume, no Redis, no Postgres. The image is a
@@ -254,13 +261,115 @@ published ports would never work. The container boundary and the compose
 loopback only. Put a TLS-terminating reverse proxy in front before exposing it,
 since every MCP request carries a bearer token.
 
+## Deployment
+
+The deployment box is small and shared with two other projects, so it does not
+build anything. CI builds the image and publishes it; the server only pulls.
+
+### Where the image lives, and why there
+
+**GitHub Container Registry** — `ghcr.io/jhonjtoloza/whats-cloud-mcp`.
+
+- GitHub Packages is free for **public** packages: no storage quota and no
+  data-transfer quota, and container registry storage and bandwidth are
+  currently free regardless.
+- Docker Hub's free tier caps anonymous pulls at 100 per 6 hours per IP address
+  and 200 authenticated. A shared server sits behind one IP and shares that
+  budget with everything else running on it, which is exactly the failure mode
+  you discover during a redeploy at the worst possible moment.
+- ghcr.io is in the same place as the source, and `GITHUB_TOKEN` already has
+  push rights — no personal access token and no repository secret to rotate.
+
+### What CI publishes
+
+`.github/workflows/publish.yml` runs on pushes to `main`, on `v*` tags and on
+manual dispatch. It runs `go vet ./...` and `go test -race ./...` **before**
+touching the registry: a green build is the precondition for an image existing
+at all.
+
+| Trigger | Tags pushed |
+|---|---|
+| push to `main` | `latest`, `sha-<short>` |
+| push of `v1.4.2` | `1.4.2`, `1.4`, `sha-<short>` |
+| `workflow_dispatch` | **none** — it builds both architectures as a dry run and publishes nothing |
+
+The image is built for `linux/amd64` and `linux/arm64`. Only the builder stage
+is multi-arch-aware and it runs on the *build* platform: Go cross-compiles, so
+`GOARCH` comes from `TARGETARCH` and nothing is ever emulated. Building the
+arm64 stage under QEMU instead would turn a seconds-long build into a
+minutes-long one, which is why the `--platform=$BUILDPLATFORM` in the
+Dockerfile is load-bearing and carries a comment saying so.
+
+### First publish: make the package public
+
+**The first package a repository publishes is private by default, even from a
+public repository.** Until it is made public, `docker compose pull` on the
+server fails with an authentication error. Fix it once, by hand:
+
+> repository → **Packages** → `whats-cloud-mcp` → **Package settings** →
+> **Change visibility** → Public
+
+Only the *first* publish needs this; every later push reuses the visibility the
+package already has. The package links itself to the repository automatically
+via the `org.opencontainers.image.source` label the workflow stamps on it.
+
+### Running it on the server
+
+```sh
+cp env.example .env          # ADMIN_TOKEN is required
+docker compose up -d
+```
+
+There is no `--build` and no checkout of the source needed beyond
+`docker-compose.yml` and `.env`. Pin a specific build by exporting `IMAGE_TAG`
+(`IMAGE_TAG=1.4.2`, or `IMAGE_TAG=sha-1a2b3c4` to roll back to an exact
+commit); it defaults to `latest`.
+
+### Upgrading
+
+```sh
+docker compose pull && docker compose up -d
+```
+
+`latest` is a moving tag, so the compose file sets `pull_policy: always` to
+stop a redeploy from silently reusing the stale local copy. The explicit
+`pull` above is still the honest way to do it, because it fails loudly when the
+registry is unreachable instead of starting the old image.
+
+### Local development
+
+The compose file pulls; the override builds:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+```
+
+`docker-compose.dev.yml` restores the `build:` block and sets
+`pull_policy: build`. Everything else — ports, environment, volume, limits,
+healthcheck, logging — comes from the base file and is not duplicated.
+
+### Why publishing it publicly is safe
+
+**The image contains one thing: the compiled binary.** Nothing else — the final
+stage is `gcr.io/distroless/static-debian12`, and the only `COPY` into it is
+`/app/gateway`.
+
+The SQLite database and the downloaded media live in the named volume mounted
+at `/data`, created at runtime on the server. `ADMIN_TOKEN` and every other
+secret arrive as environment variables from `.env`, which is git-ignored and
+never enters a build context. There are no credentials, no tenant data, no API
+key hashes and no configuration baked into the image — pulling it gives you the
+same thing as compiling the public source yourself.
+
 ## Development
 
 ```sh
 make test        # go test ./...
 make lint        # gofmt + go vet, fails on unformatted files
 make build       # the gateway binary into ./bin
-make docker-build
+make docker-build  # build the image locally, host architecture only
+make docker-dev    # build from source and start via the dev override
+make docker-deploy # pull the published image and restart
 ```
 
 Tests are table-driven and use the standard `testing` package only. The MCP

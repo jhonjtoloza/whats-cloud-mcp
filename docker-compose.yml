@@ -1,9 +1,13 @@
 services:
   gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: whats-cloud-mcp/gateway:latest
+    # Pulled, never built here. The deployment box is small and shared, so CI
+    # builds the multi-arch image and publishes it to GitHub Container Registry;
+    # the server only ever downloads it. Use docker-compose.dev.yml to build
+    # from source locally.
+    image: ghcr.io/jhonjtoloza/whats-cloud-mcp:${IMAGE_TAG:-latest}
+    # `latest` is a moving tag, so without this a redeploy would happily reuse
+    # the stale local copy. Pin IMAGE_TAG to a version or sha tag for a rollback.
+    pull_policy: always
     container_name: whats-cloud-gateway
     restart: unless-stopped
     ports:
