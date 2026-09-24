@@ -32,6 +32,7 @@ type DB struct {
 	apiKeys  *apiKeyRepo
 	sessions *sessionRepo
 	messages *messageRepo
+	chats    *chatRepo
 }
 
 // Open connects to the SQLite database at path, creating it if needed.
@@ -65,6 +66,7 @@ func Open(path string) (*DB, error) {
 	db.apiKeys = &apiKeyRepo{db: sqlDB}
 	db.sessions = &sessionRepo{db: sqlDB}
 	db.messages = &messageRepo{db: sqlDB}
+	db.chats = &chatRepo{db: sqlDB}
 	return db, nil
 }
 
@@ -104,6 +106,9 @@ func (d *DB) Sessions() Sessions { return d.sessions }
 
 // Messages returns the message repository.
 func (d *DB) Messages() Messages { return d.messages }
+
+// Chats returns the chat name repository.
+func (d *DB) Chats() Chats { return d.chats }
 
 // Migrate applies every embedded migration that has not run yet. It is safe to
 // call on every startup.
