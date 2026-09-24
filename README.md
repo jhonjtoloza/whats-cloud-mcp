@@ -307,18 +307,21 @@ arm64 stage under QEMU instead would turn a seconds-long build into a
 minutes-long one, which is why the `--platform=$BUILDPLATFORM` in the
 Dockerfile is load-bearing and carries a comment saying so.
 
-### First publish: make the package public
+### Package visibility
 
-**The first package a repository publishes is private by default, even from a
-public repository.** Until it is made public, `docker compose pull` on the
-server fails with an authentication error. Fix it once, by hand:
+A package published by a workflow from a **public** repository is public from
+its first push: verified by pulling it with an empty Docker config and no
+credentials at all. Nothing has to be changed by hand.
+
+From a **private** repository the package starts private, and until it is made
+public `docker compose pull` on the server fails with an authentication error.
+Change it once, by hand:
 
 > repository → **Packages** → `whats-cloud-mcp` → **Package settings** →
 > **Change visibility** → Public
 
-Only the *first* publish needs this; every later push reuses the visibility the
-package already has. The package links itself to the repository automatically
-via the `org.opencontainers.image.source` label the workflow stamps on it.
+The package links itself to the repository automatically via the
+`org.opencontainers.image.source` label the workflow stamps on it.
 
 ### Running it on the server
 
