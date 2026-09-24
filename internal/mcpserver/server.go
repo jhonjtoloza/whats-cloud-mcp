@@ -31,6 +31,7 @@ const version = "0.1.0"
 // Chat is the tool-facing view of a conversation.
 type Chat struct {
 	ChatJID         string `json:"chat_jid" jsonschema:"the WhatsApp JID of the conversation"`
+	Name            string `json:"name,omitempty" jsonschema:"the name WhatsApp shows for this conversation, such as a group subject; absent when none is known"`
 	LastMessageAt   string `json:"last_message_at" jsonschema:"RFC 3339 timestamp of the most recent message"`
 	LastMessageBody string `json:"last_message_body" jsonschema:"text of the most recent message"`
 	LastDirection   string `json:"last_direction" jsonschema:"in if the last message was received, out if it was sent"`
@@ -111,7 +112,7 @@ type FindContactInput struct {
 // ContactCandidate is one match of find_contact.
 type ContactCandidate struct {
 	JID         string `json:"jid" jsonschema:"the WhatsApp JID to use with list_messages, sync_history or send_message"`
-	Name        string `json:"name" jsonschema:"the best display name known for this contact"`
+	Name        string `json:"name" jsonschema:"the best display name known for this contact or group"`
 	HasMessages bool   `json:"has_messages" jsonschema:"true when messages for this chat are already stored and can be read straight away"`
 }
 
@@ -170,9 +171,10 @@ func New(deps Deps) *mcp.Server {
 
 func registerListChats(server *mcp.Server, deps Deps) {
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "list_chats",
-		Title:       "List chats",
-		Description: "List the WhatsApp conversations of the authenticated tenant, most recent activity first.",
+		Name:  "list_chats",
+		Title: "List chats",
+		Description: "List the WhatsApp conversations of the authenticated tenant, most recent activity first. " +
+			"A group carries the name it shows on WhatsApp; a chat with no name known is identified by its JID alone.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in ListChatsInput) (*mcp.CallToolResult, ListChatsOutput, error) {
 		principal, errResult := requireScope(ctx, auth.ScopeMessagesRead)
@@ -191,6 +193,7 @@ func registerListChats(server *mcp.Server, deps Deps) {
 		for _, c := range chats {
 			out.Chats = append(out.Chats, Chat{
 				ChatJID:         c.ChatJID,
+				Name:            c.Name,
 				LastMessageAt:   formatTime(c.LastMessageAt),
 				LastMessageBody: c.LastMessageBody,
 				LastDirection:   string(c.LastDirection),
@@ -320,7 +323,7 @@ func registerFindContact(server *mcp.Server, deps Deps) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:  "find_contact",
 		Title: "Find contact",
-		Description: "Find the WhatsApp JID of a contact by name, business name or phone number. " +
+		Description: "Find the WhatsApp JID of a contact by name, business name or phone number, or of a GROUP by the name it shows on WhatsApp. " +
 			"This is the first step when the user names a person rather than a JID: search here, then read the conversation with list_messages. " +
 			"Each candidate reports has_messages; when it is false, or the stored conversation turns out to be too short to answer the question, " +
 			"call sync_history for that JID to pull older messages and then read it again.",

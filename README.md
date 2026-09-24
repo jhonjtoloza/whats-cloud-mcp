@@ -116,7 +116,7 @@ number never invalidates or rotates an API key.** It is asserted by
 | `GET` | `/v1/chats` | `messages:read` | `?limit=` |
 | `GET` | `/v1/chats/{jid}/messages` | `messages:read` | `?limit=`, newest first |
 | `POST` | `/v1/chats/{jid}/sync` | `messages:read` | `{count?}` (default 50, max 200); backfills older history |
-| `GET` | `/v1/contacts` | `messages:read` | `?q=` name, business name or phone number |
+| `GET` | `/v1/contacts` | `messages:read` | `?q=` name, business name, phone number or group name |
 | `GET` | `/v1/messages/{id}/media` | `media:read` | downloads the attachment on demand and streams it; `410` when WhatsApp has expired it |
 | `POST` | `/mcp` | tenant key | MCP over Streamable HTTP |
 
@@ -143,6 +143,13 @@ The intended reading sequence is `find_contact` → `list_messages` → and, whe
 the stored conversation is missing or too shallow, `sync_history` followed by
 `list_messages` again. The tool descriptions say so, because a model has no
 other way to learn it.
+
+`find_contact` resolves a **group** by the name it shows on WhatsApp, and
+`list_chats` reports that name alongside the JID. A group has no entry in the
+address book and is addressed only as `120363424550223300@g.us`, so without a
+cached name nothing could answer "the group called obd2ip". The names live in
+the `chats` table, written from the group metadata whatsmeow reports on
+connect, on join and on rename — see [Chat names](#chat-names).
 
 The endpoint authenticates the tenant, but it cannot enforce a single scope
 because the tools differ — so **each tool checks its own scope** against
@@ -515,6 +522,42 @@ Neither the filesystem path nor any key material is ever returned over HTTP. The
 `media_key` and the two hashes are secrets — they decrypt the file on WhatsApp's
 CDN — so anything that dumps or exports the `messages` table is handling key
 material, not metadata.
+
+## Chat names
+
+A person is findable by name because the address book carries one. A **group**
+is not: WhatsApp keeps the subject in the group metadata, whatsmeow fetches it
+live and persists none of it, so a group was only ever reachable as
+`120363424550223300@g.us` — a number nobody reads on their phone.
+
+The `chats` table is that missing index. One row per `(tenant_id, chat_jid)`
+holding the display name, and it feeds two readers:
+
+- `find_contact` / `GET /v1/contacts` match the query against it, so a group
+  answers to its name. A real address-book name is never overwritten by it —
+  for a person the address book is the better source.
+- `list_chats` / `GET /v1/chats` report the name next to the JID. A chat with
+  no name known reports none, so the caller falls back to the JID rather than
+  being handed an invented one.
+
+The name is a **cache of what WhatsApp owns**, never a source of truth, and it
+is written from three events:
+
+| When | Event | Why |
+|---|---|---|
+| Every successful connection | `events.Connected` → `GetJoinedGroups` | a group may have been renamed while the gateway was down, and nothing replays that |
+| Joining a group | `events.JoinedGroup` | the name is already in the event |
+| A rename | `events.GroupInfo` with `Name != nil` | the same event also carries topic and lock changes, which say nothing about the name |
+
+The reconnect refresh runs off whatsmeow's event goroutine: it is a network
+round trip, and taken inline it would stall every message queued behind it. A
+failed refresh costs readability only — the names already cached stay, and the
+next reconnect tries again.
+
+Names are tenant-scoped like every other row. Two tenants can both belong to
+one group, and each reads only the name it wrote; that is asserted by
+`TestChatNameSearchIsTenantIsolated`, `TestListChatsIgnoresTheNameOfAnotherTenant`
+and `TestMCPChatNamesAreTenantIsolated`.
 
 ## Notes on search
 

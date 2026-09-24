@@ -11,6 +11,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/jhonjtoloza/whats-cloud-mcp/internal/store"
 	"github.com/jhonjtoloza/whats-cloud-mcp/internal/wa"
 )
 
@@ -118,6 +119,7 @@ func structured[T any](t *testing.T, res *mcp.CallToolResult) T {
 type mcpChats struct {
 	Chats []struct {
 		ChatJID         string `json:"chat_jid"`
+		Name            string `json:"name"`
 		LastMessageBody string `json:"last_message_body"`
 		MessageCount    int    `json:"message_count"`
 	} `json:"chats"`
@@ -694,6 +696,72 @@ func TestMCPToolDescriptionsExplainTheSequence(t *testing.T) {
 	for _, want := range []string{"anchor", "list_messages"} {
 		if !strings.Contains(descriptions["sync_history"], want) {
 			t.Errorf("sync_history description does not mention %q: %q", want, descriptions["sync_history"])
+		}
+	}
+}
+
+// TestMCPListChatsReportsTheGroupName is the end of the road for the chats
+// table: a group reaches the model under the name it shows on WhatsApp instead
+// of as a numeric JID nobody can recognise.
+func TestMCPListChatsReportsTheGroupName(t *testing.T) {
+	env := newTestEnv(t)
+	tenant := env.createTenant(t, "Acme", []string{"messages:read"})
+
+	const (
+		groupJID = "120363424550223300@g.us"
+		dmJID    = "5215550001111@s.whatsapp.net"
+	)
+	base := time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC)
+	seedChat(t, env, tenant.TenantID, groupJID, "in the group", base)
+	seedChat(t, env, tenant.TenantID, dmJID, "in the dm", base.Add(time.Minute))
+
+	err := env.db.Chats().Upsert(context.Background(), tenant.TenantID,
+		store.NamedChat{ChatJID: groupJID, Name: "obd2ip"})
+	if err != nil {
+		t.Fatalf("Chats().Upsert() error = %v", err)
+	}
+
+	session := connectMCP(t, env, tenant.APIKey.Key, "")
+	chats := structured[mcpChats](t, callTool(t, session, "list_chats", map[string]any{}))
+
+	names := make(map[string]string, len(chats.Chats))
+	for _, chat := range chats.Chats {
+		names[chat.ChatJID] = chat.Name
+	}
+	if names[groupJID] != "obd2ip" {
+		t.Errorf("name of the group = %q, want %q", names[groupJID], "obd2ip")
+	}
+	// A conversation nobody named must stay nameless rather than be handed an
+	// invented one: the caller falls back to the JID it already has.
+	if names[dmJID] != "" {
+		t.Errorf("name of the dm = %q, want it empty", names[dmJID])
+	}
+}
+
+// TestMCPChatNamesAreTenantIsolated is security invariant 2 on the new table.
+// The name of a group is data like any other: a tenant must never read one
+// another tenant stored, not even for an address both of them talk to.
+func TestMCPChatNamesAreTenantIsolated(t *testing.T) {
+	env := newTestEnv(t)
+	reader := env.createTenant(t, "Acme", []string{"messages:read"})
+	other := env.createTenant(t, "Globex", []string{"messages:read"})
+
+	const groupJID = "120363424550223300@g.us"
+	seedChat(t, env, reader.TenantID, groupJID, "in the group",
+		time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC))
+
+	err := env.db.Chats().Upsert(context.Background(), other.TenantID,
+		store.NamedChat{ChatJID: groupJID, Name: "secret of globex"})
+	if err != nil {
+		t.Fatalf("Chats().Upsert() error = %v", err)
+	}
+
+	session := connectMCP(t, env, reader.APIKey.Key, "")
+	chats := structured[mcpChats](t, callTool(t, session, "list_chats", map[string]any{}))
+
+	for _, chat := range chats.Chats {
+		if chat.Name != "" {
+			t.Errorf("list_chats leaked the name %q of another tenant", chat.Name)
 		}
 	}
 }
