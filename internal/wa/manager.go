@@ -47,6 +47,7 @@ type Manager struct {
 	container *sqlstore.Container
 	sessions  store.Sessions
 	messages  store.Messages
+	chats     store.Chats
 	logger    *slog.Logger
 	waLogger  waLog.Logger
 
@@ -115,6 +116,7 @@ func NewManager(ctx context.Context, db *store.DB, logger *slog.Logger, opts Man
 		container:      container,
 		sessions:       db.Sessions(),
 		messages:       db.Messages(),
+		chats:          db.Chats(),
 		logger:         logger,
 		waLogger:       waLog.Noop,
 		historyScope:   opts.HistoryScope,
@@ -457,11 +459,27 @@ func (m *Manager) handleEvent(tenantID string, evt any) {
 	case *events.Connected:
 		waJID := ""
 		m.mu.RLock()
-		if client := m.clients[tenantID]; client != nil && client.Store.ID != nil {
+		client := m.clients[tenantID]
+		m.mu.RUnlock()
+		if client != nil && client.Store.ID != nil {
 			waJID = client.Store.ID.String()
 		}
-		m.mu.RUnlock()
 		m.updateStatus(ctx, tenantID, store.SessionConnected, waJID)
+		// A group may have been renamed while the gateway was down, and
+		// nothing replays that. Every reconnect re-reads the subjects.
+		if client != nil {
+			m.syncGroupNamesInBackground(tenantID, client)
+		}
+
+	case *events.JoinedGroup:
+		m.rememberGroupName(ctx, tenantID, e.JID, e.Name)
+
+	case *events.GroupInfo:
+		// The same event carries topic, lock and membership changes; only a
+		// rename says anything about the name.
+		if e.Name != nil {
+			m.rememberGroupName(ctx, tenantID, e.JID, e.Name.Name)
+		}
 
 	case *events.Disconnected:
 		m.updateStatus(ctx, tenantID, store.SessionDisconnected, "")

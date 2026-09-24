@@ -104,6 +104,16 @@ func (m *Manager) FindContacts(ctx context.Context, tenantID, query string) ([]C
 		found[chatJID] = Contact{JID: chatJID, Name: name}
 	}
 
+	// A group has no entry in the address book and is only ever addressed by a
+	// numeric JID, so when the caller types a group name nothing above can
+	// match it. The name lives in the chats cache, filled from the group
+	// metadata WhatsApp reports on connect, on join and on rename.
+	namedChats, err := m.chats.Search(ctx, tenantID, query, maxContactResults)
+	if err != nil {
+		return nil, err
+	}
+	mergeNamedChats(found, namedChats)
+
 	out := make([]Contact, 0, len(found))
 	for _, contact := range found {
 		out = append(out, contact)
