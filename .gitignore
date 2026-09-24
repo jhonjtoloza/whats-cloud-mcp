@@ -13,6 +13,15 @@ vendor/
 
 # Runtime data: the SQLite database, its WAL sidecars and downloaded media
 /data/
+
+# Database backups, wherever they end up. `*.db` does NOT match a name like
+# whats-cloud.db.bak-20260923-232137, and a copy of data/ under another name
+# escapes the /data/ rule entirely, so one `git add -A` could stage a full
+# conversation history into a public repository.
+*.bak
+*.bak-*
+*.db.bak*
+/data_copy/
 *.db
 *.db-shm
 *.db-wal
