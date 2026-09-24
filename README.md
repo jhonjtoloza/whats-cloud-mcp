@@ -335,6 +335,40 @@ There is no `--build` and no checkout of the source needed beyond
 (`IMAGE_TAG=1.4.2`, or `IMAGE_TAG=sha-1a2b3c4` to roll back to an exact
 commit); it defaults to `latest`.
 
+### Deploying on Dokploy
+
+Use `docker-compose.prod.yml`, not `docker-compose.yml`. Dokploy routes traffic
+with Traefik over the Docker network instead of through a published host port,
+so two things differ: no `host:container` port mapping and no `container_name`.
+
+Publishing on the host's loopback is correct for a server you administer
+yourself and wrong here — it puts the gateway out of Traefik's reach entirely.
+
+There is deliberately no `networks:` block. Dokploy wires networking itself:
+with Isolated Deployments it creates a network named after the app and attaches
+every service to it, and without isolation it adds `dokploy-network` to the
+service the domain points at. Declaring it by hand only matters for a stack
+with several services that must reach each other; this one has a single
+service.
+
+Attach the domain in the Dokploy UI (Domains → Create) rather than writing
+Traefik labels by hand; hand-written labels fight with the ones Dokploy
+injects:
+
+> Service Name: `gateway` · Container Port: `8080`
+
+The container port cannot collide with another service on the same box, because
+nothing is published to the host and every container has its own network
+namespace — only a `host:container` mapping can conflict, and there is none.
+Set `APP_PORT` anyway if you want a different number; it drives both the
+published container port and `BIND_ADDR`, so they cannot drift apart. Change the
+domain's Container Port in the UI to match.
+
+Then set `MCP_ALLOWED_ORIGINS` to that domain. It can stay empty while you are
+testing from a terminal, because curl and Claude Code send no `Origin` header
+and are always allowed — but a browser does send one, and an empty list
+rejects every browser origin.
+
 ### Upgrading
 
 ```sh

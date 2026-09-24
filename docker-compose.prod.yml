@@ -1,0 +1,125 @@
+# Production deployment (Dokploy).
+#
+# Use this file instead of docker-compose.yml when the target is Dokploy, not a
+# plain `docker compose up` on a box you administer yourself. Two things
+# differ, and both come from Dokploy routing traffic with Traefik rather than
+# through a published host port:
+#
+#   1. No host port mapping. Only the container port is declared.
+#   2. No container_name.
+#
+# There is deliberately NO `networks:` block. Dokploy wires the networking
+# itself: with Isolated Deployments it creates a network named after the app and
+# attaches every service to it, and without isolation it adds `dokploy-network`
+# to the service the domain points at. Declaring `dokploy-network` by hand here
+# would only matter if this stack had SEVERAL services that must reach each
+# other, and it has one — so declaring it adds a second network for nothing and
+# fights with the isolated network when that feature is on.
+#
+# The domain is NOT configured here. Add it in the Dokploy UI (Domains ->
+# Create), which generates the Traefik labels and handles the certificate:
+#
+#     Service Name: gateway
+#     Container Port: 8080          (or APP_PORT, if you changed it)
+#
+# Writing those labels by hand here would fight with the ones Dokploy injects.
+
+services:
+  gateway:
+    # Pulled, never built. CI publishes the multi-arch image; the server only
+    # downloads it. Pin IMAGE_TAG to a sha- or version tag to roll back.
+    image: ghcr.io/jhonjtoloza/whats-cloud-mcp:${IMAGE_TAG:-latest}
+    # `latest` is a moving tag, so without this a redeploy would reuse a stale
+    # local copy.
+    pull_policy: always
+    restart: unless-stopped
+
+    # Container port only. A `host:container` mapping is the exact pattern
+    # Dokploy's documentation calls incorrect, and publishing on the host's
+    # loopback (which is right for a standalone server) would put the gateway
+    # out of Traefik's reach entirely: Traefik connects over the Docker network,
+    # not through the host. Nothing is exposed publicly by declaring this — the
+    # domain you attach in the UI is what decides who can reach the service.
+    #
+    # Because nothing is published to the host, this port CANNOT collide with
+    # another service on the same box: every container has its own network
+    # namespace, so ten containers may each listen on 8080 quite happily. Only a
+    # `host:container` mapping can conflict, and there is none here. APP_PORT
+    # exists so the value can still be moved if you want to, not because a
+    # clash is possible.
+    ports:
+      - ${APP_PORT:-8080}
+
+    environment:
+      # Required. Guards the admin credential class: it can create tenants,
+      # issue keys and start pairing, and it can NOT send or read messages.
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?ADMIN_TOKEN must be set}
+      DB_PATH: /data/whats-cloud.db
+      MEDIA_DIR: /data/media
+
+      # 0.0.0.0 INSIDE the container is deliberate and is not the same as
+      # binding 0.0.0.0 on a host. Inside a container 127.0.0.1 means the
+      # container itself, so a process bound there is unreachable from outside
+      # its own network namespace and Traefik could never connect to it. The
+      # namespace and the network are the isolation boundary here.
+      #
+      # APP_PORT is read here as well, so the listener and the published
+      # container port can never drift apart. If you change it, change the
+      # Container Port of the domain in the Dokploy UI to match: those are the
+      # only two places the number appears.
+      BIND_ADDR: 0.0.0.0:${APP_PORT:-8080}
+
+      # Comma-separated browser origins allowed on /mcp, e.g.
+      # https://whatsapp.yourdomain.com — this defends against DNS rebinding and
+      # is a MUST in the MCP Streamable HTTP spec.
+      #
+      # This matters here in a way it did not locally: curl and Claude Code send
+      # no Origin header and are always allowed, so an empty list was harmless
+      # while you tested from a terminal. Once a real domain exists, any browser
+      # DOES send one, and an empty list rejects every one of them.
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
+
+      # Chat types a pushed history sync is stored in full for:
+      # dm (default) | dm,group | all. Chats outside the scope still keep their
+      # most recent message, which is what a later backfill anchors on.
+      HISTORY_SYNC_SCOPE: ${HISTORY_SYNC_SCOPE:-dm}
+      HISTORY_SYNC_TIMEOUT: ${HISTORY_SYNC_TIMEOUT:-30s}
+
+      # Media is downloaded only when something asks for it, never on receipt,
+      # so these bound one request rather than a background job. The size cap is
+      # what keeps a single video from filling a shared disk.
+      MEDIA_MAX_BYTES: ${MEDIA_MAX_BYTES:-104857600}
+      # Media types an on-demand fetch may download. A reference is stored for
+      # every type regardless, so widening this needs no backfill.
+      MEDIA_FETCH_TYPES: ${MEDIA_FETCH_TYPES:-ptt,audio,image,video,document}
+
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
+    volumes:
+      # Holds the SQLite database, the whatsmeow session and downloaded media.
+      # This is the only thing here that cannot be rebuilt: losing it means
+      # re-pairing the number and losing every stored conversation. Back it up.
+      - whats-cloud-data:/data
+
+    # The box is shared with other projects, so cap what this can take.
+    mem_limit: 256m
+    mem_reservation: 64m
+    cpus: 1.0
+
+    healthcheck:
+      # The distroless image has no shell and no curl, so the binary probes its
+      # own health endpoint. It honours BIND_ADDR.
+      test: ["CMD", "/app/gateway", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whats-cloud-data:
