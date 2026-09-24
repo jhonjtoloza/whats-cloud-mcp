@@ -37,6 +37,15 @@ type Sessions interface {
 }
 
 // Messages persists the message log.
+//
+// Every method that takes or reports a chat address speaks ONE address per
+// conversation. WhatsApp addresses the same person two ways, by phone number
+// and by LID, and a repository that passed those through would let list_chats,
+// list_messages and the contact lookup disagree about how many conversations
+// exist. Addresses are folded together through whatsmeow's LID index, which
+// lives in this same database file, so no live WhatsApp client is involved; an
+// address the index does not know keeps its own identity rather than being
+// guessed at.
 type Messages interface {
 	// Append stores a message. A repeated (tenant_id, wa_message_id) pair is a
 	// no-op, because WhatsApp redelivers messages.
@@ -65,7 +74,9 @@ type Messages interface {
 	//
 	// This is the anchor an on-demand history request is built from: WhatsApp
 	// backfills the messages immediately BEFORE a known message, so a chat with
-	// nothing stored cannot be backfilled at all.
+	// nothing stored cannot be backfilled at all. The anchor is taken from the
+	// whole conversation, not from the half filed under the address that was
+	// passed, or the gateway would keep asking for history it already holds.
 	OldestByChat(ctx context.Context, tenantID, chatJID string) (Message, error)
 	// SearchChats returns the chat JIDs whose address or sender matches the
 	// query, most recent activity first.
@@ -74,8 +85,12 @@ type Messages interface {
 	// the contact lookup tool needs before deciding whether to backfill.
 	SearchChats(ctx context.Context, tenantID, query string, limit int) ([]string, error)
 	// ListByChat returns the most recent messages of a chat, newest first.
+	//
+	// The chat may be named by either of its addresses, with or without a
+	// device suffix; all of them read the same conversation.
 	ListByChat(ctx context.Context, tenantID, chatJID string, limit int) ([]Message, error)
-	// ListChats returns conversation summaries ordered by most recent activity.
+	// ListChats returns conversation summaries ordered by most recent activity,
+	// one per person rather than one per address.
 	ListChats(ctx context.Context, tenantID string, limit int) ([]Chat, error)
 	// Search performs a substring match over message bodies.
 	//

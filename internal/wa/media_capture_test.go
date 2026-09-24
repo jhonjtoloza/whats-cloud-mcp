@@ -43,7 +43,7 @@ func TestBothPersistencePathsCaptureTheReference(t *testing.T) {
 			logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		}
 
-		manager.persistInbound(context.Background(), tenantID, &events.Message{
+		manager.persistMessage(context.Background(), tenantID, &events.Message{
 			Info: types.MessageInfo{
 				MessageSource: types.MessageSource{Chat: dm, Sender: dm},
 				ID:            "LIVE-1",
@@ -123,7 +123,7 @@ func TestPersistedTextMessagesCarryNoMediaColumns(t *testing.T) {
 	}
 	dm := types.NewJID("573001234567", types.DefaultUserServer)
 
-	manager.persistInbound(context.Background(), "tenant-a", &events.Message{
+	manager.persistMessage(context.Background(), "tenant-a", &events.Message{
 		Info: types.MessageInfo{
 			MessageSource: types.MessageSource{Chat: dm, Sender: dm},
 			ID:            "LIVE-TEXT",

@@ -107,7 +107,20 @@ func (d *DB) Messages() Messages { return d.messages }
 
 // Migrate applies every embedded migration that has not run yet. It is safe to
 // call on every startup.
-func (d *DB) Migrate(ctx context.Context) error {
+func (d *DB) Migrate(ctx context.Context) (err error) {
+	// A migration may need to read whatsmeow's LID index, which lives in this
+	// same file but is created by whatsmeow's own upgrade — and that runs
+	// AFTER ours. See ensureLIDMapReadable.
+	done, err := d.ensureLIDMapReadable(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cleanupErr := done(); cleanupErr != nil && err == nil {
+			err = cleanupErr
+		}
+	}()
+
 	if _, err := d.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS `+migrationsTable+` (
 		name       TEXT PRIMARY KEY,
 		applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -134,6 +147,39 @@ func (d *DB) Migrate(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// ensureLIDMapReadable makes whatsmeow's LID index selectable for the duration
+// of Migrate, and returns the cleanup that undoes it.
+//
+// The gateway migrates its own schema BEFORE whatsmeow upgrades its own, so on
+// a fresh database whatsmeow_lid_map does not exist yet and a migration that
+// joins it could not even be prepared, let alone run. A fresh database also has
+// no addresses to canonicalise, so an empty stand-in is not a workaround but
+// the honest answer: there are no mappings, because there is nothing to map.
+//
+// It is a TEMP VIEW rather than a table. whatsmeow owns every whatsmeow_*
+// table and we never create one, and the view is dropped again before Migrate
+// returns, so it can never shadow the real table once whatsmeow appears.
+func (d *DB) ensureLIDMapReadable(ctx context.Context) (func() error, error) {
+	present, err := tableExists(ctx, d.db, lidMapTable)
+	if err != nil {
+		return nil, err
+	}
+	if present {
+		return func() error { return nil }, nil
+	}
+
+	if _, err := d.db.ExecContext(ctx,
+		`CREATE TEMP VIEW `+lidMapTable+` (lid, pn) AS SELECT NULL, NULL WHERE 0`); err != nil {
+		return nil, fmt.Errorf("store: create lid map stand-in: %w", err)
+	}
+	return func() error {
+		if _, err := d.db.ExecContext(ctx, `DROP VIEW temp.`+lidMapTable); err != nil {
+			return fmt.Errorf("store: drop lid map stand-in: %w", err)
+		}
+		return nil
+	}, nil
 }
 
 func (d *DB) applyMigration(ctx context.Context, name string) error {

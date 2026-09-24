@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,7 +17,12 @@ const (
 	maxMessageLimit = 500
 )
 
-type messageRepo struct{ db *sql.DB }
+type messageRepo struct {
+	db *sql.DB
+	// lidMap remembers that whatsmeow's LID index has appeared; see
+	// lidMapReady.
+	lidMap atomic.Bool
+}
 
 // messageColumns is the read projection, and also the insert projection: the
 // media_* bookkeeping columns at the end are written by UpdateMedia rather than
@@ -139,14 +145,20 @@ func (r *messageRepo) AppendBatch(ctx context.Context, messages []Message) (int,
 }
 
 // OldestByChat returns the oldest stored message of a chat.
+//
+// It reads the whole conversation, not the half filed under the address the
+// caller happened to pass: an anchor taken from one side of a split chat would
+// ask WhatsApp for history the gateway already holds.
 func (r *messageRepo) OldestByChat(ctx context.Context, tenantID, chatJID string) (Message, error) {
+	aliases := r.chatAliases(ctx, chatJID)
+
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT `+messageColumns+`
 		 FROM messages
-		 WHERE tenant_id = ? AND chat_jid = ?
+		 WHERE tenant_id = ? AND chat_jid IN (`+placeholders(len(aliases))+`)
 		 ORDER BY timestamp ASC, id ASC
 		 LIMIT 1`,
-		tenantID, chatJID)
+		chatArgs(tenantID, aliases)...)
 	if err != nil {
 		return Message{}, fmt.Errorf("store: oldest message: %w", err)
 	}
@@ -162,6 +174,10 @@ func (r *messageRepo) OldestByChat(ctx context.Context, tenantID, chatJID string
 
 // SearchChats returns the chats whose address or sender matches the query.
 //
+// Both addresses of a person are matched and the answer is reported under the
+// canonical one, so a lookup by phone number finds a conversation whose rows
+// are filed under a LID, and finds it once.
+//
 // Like Search, this is a LIKE scan rather than FTS5, for the reason documented
 // on the Messages interface.
 func (r *messageRepo) SearchChats(ctx context.Context, tenantID, query string, limit int) ([]string, error) {
@@ -170,16 +186,22 @@ func (r *messageRepo) SearchChats(ctx context.Context, tenantID, query string, l
 		return nil, nil
 	}
 	pattern := "%" + escapeLike(query) + "%"
+	addr := r.addressing(ctx)
 
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT chat_jid
-		 FROM messages
-		 WHERE tenant_id = ?
-		   AND (chat_jid LIKE ? ESCAPE '\' OR sender_jid LIKE ? ESCAPE '\')
-		 GROUP BY chat_jid
-		 ORDER BY max(timestamp) DESC, chat_jid ASC
+		// The result column is NOT named chat_jid: SQLite resolves a GROUP BY
+		// name against the source columns first, so an alias sharing the name
+		// of a real column would silently group by the raw address and report
+		// the merged conversation twice.
+		`SELECT `+addr.chat+` AS canonical_chat_jid
+		 FROM messages`+addr.chatJoin+addr.senderJoin+`
+		 WHERE messages.tenant_id = ?
+		   AND (`+addr.chat+` LIKE ? ESCAPE '\' OR messages.chat_jid LIKE ? ESCAPE '\'
+		        OR `+addr.sender+` LIKE ? ESCAPE '\' OR messages.sender_jid LIKE ? ESCAPE '\')
+		 GROUP BY canonical_chat_jid
+		 ORDER BY max(messages.timestamp) DESC, canonical_chat_jid ASC
 		 LIMIT ?`,
-		tenantID, pattern, pattern, normalizeLimit(limit))
+		tenantID, pattern, pattern, pattern, pattern, normalizeLimit(limit))
 	if err != nil {
 		return nil, fmt.Errorf("store: search chats: %w", err)
 	}
@@ -196,32 +218,61 @@ func (r *messageRepo) SearchChats(ctx context.Context, tenantID, query string, l
 	return out, rows.Err()
 }
 
+// ListByChat returns the most recent messages of a chat, newest first.
+//
+// The conversation is addressed by every form it may be stored under, so a
+// caller holding a phone number reads the messages filed under the matching
+// LID too. Anything else would answer a question nobody asked: "the part of
+// this conversation that happens to use the address you typed".
 func (r *messageRepo) ListByChat(ctx context.Context, tenantID, chatJID string, limit int) ([]Message, error) {
+	aliases := r.chatAliases(ctx, chatJID)
+
+	args := chatArgs(tenantID, aliases)
+	args = append(args, normalizeLimit(limit))
+
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT `+messageColumns+`
 		 FROM messages
-		 WHERE tenant_id = ? AND chat_jid = ?
+		 WHERE tenant_id = ? AND chat_jid IN (`+placeholders(len(aliases))+`)
 		 ORDER BY timestamp DESC, id DESC
 		 LIMIT ?`,
-		tenantID, chatJID, normalizeLimit(limit))
+		args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: list messages: %w", err)
 	}
 	return collectMessages(rows)
 }
 
+// chatArgs lays a tenant and its chat aliases out in the order an IN clause
+// expects.
+func chatArgs(tenantID string, aliases []string) []any {
+	args := make([]any, 0, len(aliases)+2)
+	args = append(args, tenantID)
+	for _, alias := range aliases {
+		args = append(args, alias)
+	}
+	return args
+}
+
+// ListChats returns conversation summaries, one per person rather than one per
+// address: the two ways WhatsApp addresses the same person are folded together
+// through whatsmeow's LID index, which lives in this very database file.
 func (r *messageRepo) ListChats(ctx context.Context, tenantID string, limit int) ([]Chat, error) {
+	addr := r.addressing(ctx)
+
 	// A window function picks the newest row per chat. max() with bare columns
 	// would be shorter, but an aggregate drops the column's declared type and
 	// the driver would then hand back the timestamp as a string.
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT chat_jid, timestamp, body, direction, message_count
 		 FROM (
-		     SELECT chat_jid, timestamp, body, direction,
-		            count(*) OVER (PARTITION BY chat_jid) AS message_count,
-		            row_number() OVER (PARTITION BY chat_jid ORDER BY timestamp DESC, id DESC) AS row_num
-		     FROM messages
-		     WHERE tenant_id = ?
+		     SELECT `+addr.chat+` AS chat_jid, messages.timestamp AS timestamp,
+		            messages.body AS body, messages.direction AS direction,
+		            count(*) OVER (PARTITION BY `+addr.chat+`) AS message_count,
+		            row_number() OVER (PARTITION BY `+addr.chat+`
+		                               ORDER BY messages.timestamp DESC, messages.id DESC) AS row_num
+		     FROM messages`+addr.chatJoin+`
+		     WHERE messages.tenant_id = ?
 		 )
 		 WHERE row_num = 1
 		 ORDER BY timestamp DESC, chat_jid ASC

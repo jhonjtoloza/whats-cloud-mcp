@@ -88,7 +88,7 @@ func historyDecisionFor(scope config.HistorySyncScope, chat types.JID) historyDe
 // History arrives as waWeb.WebMessageInfo, which is a different shape from the
 // events.Message the live stream delivers: the addressing lives in a
 // waCommon.MessageKey and the timestamp is a Unix second count. That is why
-// this is a separate path rather than a detour through persistInbound.
+// this is a separate path rather than a detour through persistMessage.
 //
 // Messages that cannot be addressed or identified are dropped rather than
 // failing the batch: one malformed row in a chunk of a thousand must not cost
@@ -196,23 +196,30 @@ func (m *Manager) persistHistorySync(ctx context.Context, tenantID string, e *ev
 
 	syncType := data.GetSyncType()
 	ownJID := m.ownJID(tenantID)
+	lids := m.lidsFor(tenantID)
 	conversations := data.GetConversations()
 
 	inserted := 0
 	for _, conv := range conversations {
-		chat, err := types.ParseJID(conv.GetID())
-		if err != nil || chat.User == "" {
+		raw, err := types.ParseJID(conv.GetID())
+		if err != nil || raw.User == "" {
 			m.logger.WarnContext(ctx, "history sync carried an unusable conversation id",
 				slog.String("tenant_id", tenantID),
 				slog.String("sync_type", syncType.String()))
 			continue
 		}
+		// History is a write path too. Storing the address the sync happened to
+		// use would file the same conversation under a second address all over
+		// again, undoing the merge for every chat the phone pushes back.
+		chat, chatCanonical := canonicalJID(ctx, lids, raw, types.EmptyJID)
+		m.countUnresolved(ctx, tenantID, chatCanonical, true)
 
 		records := historyRecords(tenantID, ownJID, chat,
 			historyDecisionFor(m.historyScope, chat), conv.GetMessages())
 		if len(records) == 0 {
 			continue
 		}
+		m.canonicaliseSenders(ctx, lids, tenantID, records)
 
 		added, err := m.messages.AppendBatch(ctx, records)
 		if err != nil {
@@ -234,6 +241,29 @@ func (m *Manager) persistHistorySync(ctx context.Context, tenantID string, e *ev
 		slog.String("sync_type", syncType.String()),
 		slog.Int("conversations", len(conversations)),
 		slog.Int("messages_inserted", inserted))
+}
+
+// canonicaliseSenders resolves the participant addresses of a history batch.
+//
+// A history message key carries one participant and no alternative address, so
+// the LID index is the only source here; an address it does not know is kept
+// exactly as it arrived.
+//
+// The addresses are re-parsed rather than resolved inside historyRecords so
+// that mapping a history message onto a row stays a pure function of the event,
+// which is what makes it testable without a client.
+func (m *Manager) canonicaliseSenders(
+	ctx context.Context, lids lidResolver, tenantID string, records []store.Message,
+) {
+	for i := range records {
+		sender, err := types.ParseJID(records[i].SenderJID)
+		if err != nil || sender.IsEmpty() {
+			continue
+		}
+		canonical, ok := canonicalJID(ctx, lids, sender, types.EmptyJID)
+		records[i].SenderJID = canonical.String()
+		m.countUnresolved(ctx, tenantID, true, ok)
+	}
 }
 
 // deliverOnDemand wakes the SyncHistory call that asked for this chat, if one
@@ -267,7 +297,15 @@ func (m *Manager) SyncHistory(ctx context.Context, tenantID, chatJID string, cou
 	}
 	count = NormalizeSyncCount(count)
 
-	anchor, err := m.messages.OldestByChat(ctx, tenantID, chat.String())
+	// The reply arrives as an unrelated event and is matched back to this call
+	// by chat, so both ends have to name the conversation the same way. The
+	// reply is canonicalised when it is stored, and a caller may hold either of
+	// the two addresses, so the canonical form is the only one they can meet
+	// on. The REQUEST keeps the address it was given: that one goes to
+	// WhatsApp, which addressed the conversation in the first place.
+	canonical, _ := canonicalJID(ctx, m.lidsFor(tenantID), chat, types.EmptyJID)
+
+	anchor, err := m.messages.OldestByChat(ctx, tenantID, canonical.String())
 	if errors.Is(err, store.ErrNotFound) {
 		return SyncResult{}, ErrNoAnchorMessage
 	}
@@ -275,7 +313,7 @@ func (m *Manager) SyncHistory(ctx context.Context, tenantID, chatJID string, cou
 		return SyncResult{}, err
 	}
 
-	key := historyKey(tenantID, chat.String())
+	key := historyKey(tenantID, canonical.String())
 	replies, release, err := m.pending.register(key)
 	if err != nil {
 		return SyncResult{}, err
@@ -303,7 +341,7 @@ func (m *Manager) SyncHistory(ctx context.Context, tenantID, chatJID string, cou
 	select {
 	case delivery := <-replies:
 		return SyncResult{
-			ChatJID:         chat.String(),
+			ChatJID:         canonical.String(),
 			Inserted:        delivery.Inserted,
 			OldestTimestamp: delivery.Oldest,
 			// The phone answers with at most the requested number of messages,

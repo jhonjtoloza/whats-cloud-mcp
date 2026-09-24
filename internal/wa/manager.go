@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -53,6 +54,11 @@ type Manager struct {
 	historyTimeout time.Duration
 	pending        *pendingHistory
 	media          *mediaFetcher
+
+	// unresolvedAddresses counts the LIDs no alternative address and no lookup
+	// could turn into a phone number. Those rows keep their raw address, so the
+	// counter is the only sign that a conversation may still be split.
+	unresolvedAddresses atomic.Uint64
 
 	mu      sync.RWMutex
 	clients map[string]*whatsmeow.Client
@@ -411,7 +417,7 @@ func (m *Manager) handleEvent(tenantID string, evt any) {
 
 	switch e := evt.(type) {
 	case *events.Message:
-		m.persistInbound(ctx, tenantID, e)
+		m.persistMessage(ctx, tenantID, e)
 
 	case *events.HistorySync:
 		m.persistHistorySync(ctx, tenantID, e)
@@ -433,17 +439,55 @@ func (m *Manager) handleEvent(tenantID string, evt any) {
 	}
 }
 
-func (m *Manager) persistInbound(ctx context.Context, tenantID string, e *events.Message) {
-	body := extractText(e.Message)
+// persistMessage stores one live message, in either direction.
+//
+// It handles BOTH directions on purpose. WhatsApp delivers the tenant's own
+// messages — the ones they typed on their phone — through the very same event,
+// distinguished only by Info.IsFromMe. This function used to be called
+// persistInbound and hardcoded store.DirectionIn, and the name is what made
+// that look correct; the history path has always read the direction off the
+// message key.
+//
+// Both addresses are canonicalised before the row is written, so the live path
+// can never file one conversation under two addresses. A group keeps its own
+// @g.us address and only its participant is resolved.
+func (m *Manager) persistMessage(ctx context.Context, tenantID string, e *events.Message) {
+	lids := m.lidsFor(tenantID)
+
+	chat, chatCanonical := canonicalJID(ctx, lids, e.Info.Chat, chatAlt(e.Info.MessageSource))
+	sender, senderCanonical := canonicalJID(ctx, lids, e.Info.Sender, e.Info.SenderAlt)
+	m.countUnresolved(ctx, tenantID, chatCanonical, senderCanonical)
+
+	record := liveRecord(tenantID, e, chat, sender)
+
+	if err := m.messages.Append(ctx, record); err != nil {
+		// Message bodies are never logged.
+		m.logger.ErrorContext(ctx, "could not persist message",
+			slog.String("tenant_id", tenantID),
+			slog.String("wa_message_id", record.WAMessageID),
+			slog.String("direction", string(record.Direction)),
+			slog.String("error", err.Error()))
+	}
+}
+
+// liveRecord maps one live message onto a row.
+//
+// chat and sender arrive already resolved because resolving a LID may need the
+// tenant's client, and this mapping deliberately needs nothing but the event.
+func liveRecord(tenantID string, e *events.Message, chat, sender types.JID) store.Message {
+	direction := store.DirectionIn
+	if e.Info.IsFromMe {
+		direction = store.DirectionOut
+	}
 
 	record := store.Message{
 		ID:          store.NewID(),
 		TenantID:    tenantID,
-		ChatJID:     e.Info.Chat.String(),
-		SenderJID:   e.Info.Sender.String(),
+		ChatJID:     chat.ToNonAD().String(),
+		SenderJID:   sender.ToNonAD().String(),
 		WAMessageID: string(e.Info.ID),
-		Direction:   store.DirectionIn,
-		Body:        body,
+		Direction:   direction,
+		Body:        extractText(e.Message),
 		Timestamp:   e.Info.Timestamp.UTC(),
 		CreatedAt:   time.Now().UTC(),
 	}
@@ -459,14 +503,45 @@ func (m *Manager) persistInbound(ctx context.Context, tenantID string, e *events
 		mediaType := e.Info.MediaType
 		record.MediaType = &mediaType
 	}
+	return record
+}
 
-	if err := m.messages.Append(ctx, record); err != nil {
-		// Message bodies are never logged.
-		m.logger.ErrorContext(ctx, "could not persist inbound message",
-			slog.String("tenant_id", tenantID),
-			slog.String("wa_message_id", record.WAMessageID),
-			slog.String("error", err.Error()))
+// lidsFor returns the tenant's LID index, or nil when the tenant has no client.
+//
+// A nil index is a normal state rather than a failure: an address that cannot
+// be resolved is stored as it arrived.
+func (m *Manager) lidsFor(tenantID string) lidResolver {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if client := m.clients[tenantID]; client != nil && client.Store != nil && client.Store.LIDs != nil {
+		return client.Store.LIDs
 	}
+	return nil
+}
+
+// countUnresolved records addresses that stayed LIDs.
+//
+// It is a counter rather than an alert: a handful of unresolvable LIDs is the
+// normal state of a live database, and the number is what says whether that is
+// still true. It is logged at debug level only, because an address identifies a
+// person as surely as a body identifies a conversation.
+func (m *Manager) countUnresolved(ctx context.Context, tenantID string, chatCanonical, senderCanonical bool) {
+	unresolved := 0
+	if !chatCanonical {
+		unresolved++
+	}
+	if !senderCanonical {
+		unresolved++
+	}
+	if unresolved == 0 {
+		return
+	}
+
+	total := m.unresolvedAddresses.Add(uint64(unresolved))
+	m.logger.DebugContext(ctx, "could not resolve a lid to a phone number",
+		slog.String("tenant_id", tenantID),
+		slog.Uint64("unresolved_addresses_total", total))
 }
 
 func (m *Manager) updateStatus(ctx context.Context, tenantID string, status store.SessionStatus, waJID string) {
