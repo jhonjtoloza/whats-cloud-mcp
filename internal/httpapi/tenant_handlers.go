@@ -43,6 +43,9 @@ type sendMessageRequest struct {
 	Body string `json:"body"`
 }
 
+// sendMessageResponse reports what was sent rather than what was asked for:
+// "to" is the address the conversation is filed under, which is the one to read
+// the chat back with, and "sent_at" is the timestamp WhatsApp recorded.
 type sendMessageResponse struct {
 	WAMessageID string    `json:"wa_message_id"`
 	To          string    `json:"to"`
@@ -76,7 +79,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	waMessageID, err := s.sessions.SendText(ctx, principal.TenantID, to, body)
+	sent, err := s.sessions.SendText(ctx, principal.TenantID, to, body)
 	if err != nil {
 		if writeWAError(w, err) {
 			return
@@ -90,36 +93,38 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sentAt := time.Now().UTC()
+	// Everything but the body comes from the send: the caller's string may be a
+	// bare number or a LID, and filing the row under it would split the
+	// conversation the inbound paths file under one address.
 	record := store.Message{
 		ID:          store.NewID(),
 		TenantID:    principal.TenantID,
-		ChatJID:     to,
-		SenderJID:   "",
-		WAMessageID: waMessageID,
+		ChatJID:     sent.ChatJID,
+		SenderJID:   sent.SenderJID,
+		WAMessageID: sent.WAMessageID,
 		Direction:   store.DirectionOut,
 		Body:        body,
-		Timestamp:   sentAt,
-		CreatedAt:   sentAt,
+		Timestamp:   sent.Timestamp.UTC(),
+		CreatedAt:   time.Now().UTC(),
 	}
 	if err := s.db.Messages().Append(ctx, record); err != nil {
 		// The message did leave, so this is logged but not reported as a
 		// failure to the caller.
 		s.logger.ErrorContext(ctx, "could not persist outbound message",
 			slog.String("tenant_id", principal.TenantID),
-			slog.String("wa_message_id", waMessageID),
+			slog.String("wa_message_id", sent.WAMessageID),
 			slog.String("error", err.Error()))
 	}
 
 	s.logger.InfoContext(ctx, "message sent",
 		slog.String("tenant_id", principal.TenantID),
-		slog.String("to", to),
-		slog.String("wa_message_id", waMessageID))
+		slog.String("chat_jid", sent.ChatJID),
+		slog.String("wa_message_id", sent.WAMessageID))
 
 	writeJSON(w, http.StatusCreated, sendMessageResponse{
-		WAMessageID: waMessageID,
-		To:          to,
-		SentAt:      sentAt,
+		WAMessageID: sent.WAMessageID,
+		To:          sent.ChatJID,
+		SentAt:      sent.Timestamp.UTC(),
 	})
 }
 

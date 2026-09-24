@@ -100,7 +100,7 @@ type SendMessageInput struct {
 // SendMessageOutput is the result of send_message.
 type SendMessageOutput struct {
 	WAMessageID string `json:"wa_message_id" jsonschema:"the id WhatsApp assigned to the sent message"`
-	To          string `json:"to" jsonschema:"the destination the message was sent to"`
+	To          string `json:"to" jsonschema:"the chat JID the message was filed under; pass this one to list_messages, not the address that was sent to"`
 }
 
 // FindContactInput are the arguments of find_contact.
@@ -276,7 +276,7 @@ func registerSendMessage(server *mcp.Server, deps Deps) {
 			return toolError("body is required"), SendMessageOutput{}, nil
 		}
 
-		waMessageID, err := deps.Sessions.SendText(ctx, principal.TenantID, in.To, in.Body)
+		sent, err := deps.Sessions.SendText(ctx, principal.TenantID, in.To, in.Body)
 		if err != nil {
 			// The body is never logged.
 			deps.Logger.ErrorContext(ctx, "mcp send_message failed",
@@ -286,24 +286,28 @@ func registerSendMessage(server *mcp.Server, deps Deps) {
 			return toolError(describeSendError(err)), SendMessageOutput{}, nil
 		}
 
+		// The row is written from what the send reported, never from the
+		// argument: a model passes whatever address it was given — a bare
+		// number, a phone JID or a LID — and all of them name one conversation.
 		if err := deps.Messages.Append(ctx, store.Message{
 			ID:          store.NewID(),
 			TenantID:    principal.TenantID,
-			ChatJID:     in.To,
-			WAMessageID: waMessageID,
+			ChatJID:     sent.ChatJID,
+			SenderJID:   sent.SenderJID,
+			WAMessageID: sent.WAMessageID,
 			Direction:   store.DirectionOut,
 			Body:        in.Body,
-			Timestamp:   time.Now().UTC(),
+			Timestamp:   sent.Timestamp.UTC(),
 			CreatedAt:   time.Now().UTC(),
 		}); err != nil {
 			// The message did leave; failing to record it is not a send failure.
 			deps.Logger.ErrorContext(ctx, "could not persist outbound mcp message",
 				slog.String("tenant_id", principal.TenantID),
-				slog.String("wa_message_id", waMessageID),
+				slog.String("wa_message_id", sent.WAMessageID),
 				slog.String("error", err.Error()))
 		}
 
-		return nil, SendMessageOutput{WAMessageID: waMessageID, To: in.To}, nil
+		return nil, SendMessageOutput{WAMessageID: sent.WAMessageID, To: sent.ChatJID}, nil
 	})
 }
 

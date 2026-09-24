@@ -279,12 +279,22 @@ func TestMCPListChatsAndMessages(t *testing.T) {
 }
 
 func TestMCPSendMessage(t *testing.T) {
+	const canonical = "5215550002222@s.whatsapp.net"
+
 	env := newTestEnv(t)
 	tenant := env.createTenant(t, "Acme", []string{"messages:send"})
+	// A model passes whatever address it was handed; the send is what says
+	// which conversation the message belongs to.
+	env.sessions.sendResult = wa.SentMessage{
+		WAMessageID: "WA-MSG-MCP",
+		ChatJID:     canonical,
+		SenderJID:   fakeOwnJID,
+		Timestamp:   fakeSentAt,
+	}
 	session := connectMCP(t, env, tenant.APIKey.Key, "")
 
 	res := callTool(t, session, "send_message", map[string]any{
-		"to":   "5215550002222@s.whatsapp.net",
+		"to":   "521 555 000 2222",
 		"body": "sent through mcp",
 	})
 	if res.IsError {
@@ -302,13 +312,21 @@ func TestMCPSendMessage(t *testing.T) {
 		t.Errorf("body = %q", calls[0].Body)
 	}
 
-	// The outbound message is recorded just as the REST path records it.
-	stored, err := env.db.Messages().ListByChat(context.Background(), tenant.TenantID, "5215550002222@s.whatsapp.net", 10)
+	// The outbound message is recorded just as the REST path records it: under
+	// the address the send resolved, with the tenant as its sender and the
+	// timestamp WhatsApp reported.
+	stored, err := env.db.Messages().ListByChat(context.Background(), tenant.TenantID, canonical, 10)
 	if err != nil {
 		t.Fatalf("ListByChat() error = %v", err)
 	}
 	if len(stored) != 1 {
-		t.Errorf("persisted %d outbound messages, want 1", len(stored))
+		t.Fatalf("persisted %d outbound messages, want 1", len(stored))
+	}
+	if stored[0].SenderJID != fakeOwnJID {
+		t.Errorf("SenderJID = %q, want the tenant's own address %q", stored[0].SenderJID, fakeOwnJID)
+	}
+	if !stored[0].Timestamp.Equal(fakeSentAt) {
+		t.Errorf("Timestamp = %s, want the timestamp the send reported %s", stored[0].Timestamp, fakeSentAt)
 	}
 }
 

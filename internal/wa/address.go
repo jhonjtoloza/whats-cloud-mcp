@@ -67,6 +67,31 @@ func canonicalJID(ctx context.Context, lids lidResolver, jid, alt types.JID) (ty
 	return jid.ToNonAD(), false
 }
 
+// sendDestination resolves the address one send is addressed AND stored under.
+//
+// The two have to be the same address, and it has to be the address the inbound
+// paths use, or a conversation splits from the other direction: a caller typing
+// "573004725680" would open a chat of its own next to the
+// "573004725680@s.whatsapp.net" every received message is filed under, and a
+// caller holding a LID would open a third.
+//
+// It reuses the very machinery the inbound paths use — parseJID for the
+// caller's string, canonicalJID for the address — so the two directions cannot
+// drift apart. There is no alternative address to work from here: a destination
+// is a string somebody typed, not an event, so the LID index is the only source.
+//
+// The bool reports whether the address is canonical; false means a LID nothing
+// could resolve, which is still sent to and still stored, under the only
+// address anybody has for it.
+func sendDestination(ctx context.Context, lids lidResolver, toJID string) (types.JID, bool, error) {
+	jid, err := parseJID(toJID)
+	if err != nil {
+		return types.EmptyJID, false, err
+	}
+	chat, canonical := canonicalJID(ctx, lids, jid, types.EmptyJID)
+	return chat, canonical, nil
+}
+
 // chatAlt picks the alternative address of the conversation a live message
 // belongs to.
 //

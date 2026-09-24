@@ -284,28 +284,60 @@ func (m *Manager) Status(ctx context.Context, tenantID string) (SessionStatus, e
 	return status, nil
 }
 
-// SendText sends a plain text message and returns the WhatsApp message id.
-func (m *Manager) SendText(ctx context.Context, tenantID, toJID, body string) (string, error) {
+// SendText sends a plain text message and reports what was sent.
+//
+// The destination is canonicalised BEFORE the message leaves and the very same
+// address is what the caller persists, so the two directions of one
+// conversation can never be filed apart.
+func (m *Manager) SendText(ctx context.Context, tenantID, toJID, body string) (SentMessage, error) {
 	m.mu.RLock()
 	client := m.clients[tenantID]
 	m.mu.RUnlock()
 
 	if client == nil || !client.IsLoggedIn() {
-		return "", ErrNotPaired
+		return SentMessage{}, ErrNotPaired
 	}
 
-	jid, err := parseJID(toJID)
+	chat, canonical, err := sendDestination(ctx, m.lidsFor(tenantID), toJID)
 	if err != nil {
-		return "", err
+		return SentMessage{}, err
 	}
+	// The sender is the tenant's own address, which is canonical by
+	// construction; only the destination can stay a LID.
+	m.countUnresolved(ctx, tenantID, canonical, true)
 
-	resp, err := client.SendMessage(ctx, jid, &waProto.Message{
+	resp, err := client.SendMessage(ctx, chat, &waProto.Message{
 		Conversation: proto.String(body),
 	})
 	if err != nil {
-		return "", fmt.Errorf("wa: send message: %w", err)
+		return SentMessage{}, fmt.Errorf("wa: send message: %w", err)
 	}
-	return string(resp.ID), nil
+	return sentRecord(resp, chat, m.ownJID(tenantID)), nil
+}
+
+// sentRecord maps one send response onto the values a row is written from.
+//
+// It deliberately ignores two fields the response carries. SendResponse.Chat is
+// the address whatsmeow actually sent on, which it may have swapped for a LID on
+// the way out, so storing it would undo the canonicalisation the send just did.
+// SendResponse.Sender is documented as "currently not reliable in all cases"
+// and is the own LID on that same path, so the tenant's own address is taken
+// from the client store instead, exactly as the history path takes it.
+//
+// The timestamp comes off the server's acknowledgement. A response that carries
+// none leaves a zero time, which would file the message at the start of the
+// epoch, so the send time stands in — the one value here that is ours.
+func sentRecord(resp whatsmeow.SendResponse, chat, own types.JID) SentMessage {
+	timestamp := resp.Timestamp.UTC()
+	if resp.Timestamp.IsZero() {
+		timestamp = time.Now().UTC()
+	}
+	return SentMessage{
+		WAMessageID: string(resp.ID),
+		ChatJID:     chat.ToNonAD().String(),
+		SenderJID:   own.ToNonAD().String(),
+		Timestamp:   timestamp,
+	}
 }
 
 // Logout unlinks the tenant's device. The tenant's API keys stay valid: they

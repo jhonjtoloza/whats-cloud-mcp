@@ -97,6 +97,30 @@ type PairingResult struct {
 	QR       string      `json:"qr,omitempty"`
 }
 
+// SentMessage is what one send actually produced.
+//
+// It exists because the send is the only place that knows these values. The
+// caller holds a string it typed, which may be a bare number or a LID; the
+// address the conversation is filed under, the tenant's own JID and the moment
+// WhatsApp recorded are all decided inside the send, and persisting anything
+// else files the outgoing half of a conversation away from the incoming half.
+type SentMessage struct {
+	// WAMessageID is the id WhatsApp assigned to the message.
+	WAMessageID string
+	// ChatJID is the conversation the message belongs to, canonicalised the
+	// same way the inbound paths canonicalise theirs and always non-AD. A LID
+	// that nothing can resolve keeps its own address rather than being given an
+	// invented one.
+	ChatJID string
+	// SenderJID is the tenant's own address, non-AD. The tenant's JID carries a
+	// device suffix ("573114276555:87@s.whatsapp.net"), and a row written with
+	// it can never be matched against the plain address.
+	SenderJID string
+	// Timestamp is the time WhatsApp recorded for the message, not the moment
+	// the gateway happened to call.
+	Timestamp time.Time
+}
+
 // SessionStatus is the connection state reported for a tenant.
 type SessionStatus struct {
 	TenantID  string `json:"tenant_id"`
@@ -117,8 +141,10 @@ type SessionManager interface {
 	StartPairing(ctx context.Context, tenantID string, phone string) (PairingResult, error)
 	// Status reports the tenant's current connection state.
 	Status(ctx context.Context, tenantID string) (SessionStatus, error)
-	// SendText sends a plain text message and returns the WhatsApp message id.
-	SendText(ctx context.Context, tenantID, toJID, body string) (string, error)
+	// SendText sends a plain text message and reports what was sent: the
+	// WhatsApp message id, the address the conversation is filed under, the
+	// tenant's own address and the timestamp WhatsApp recorded.
+	SendText(ctx context.Context, tenantID, toJID, body string) (SentMessage, error)
 	// Logout unlinks the tenant's device and drops the client.
 	Logout(ctx context.Context, tenantID string) error
 	// FindContacts resolves a free-text query against the tenant's address

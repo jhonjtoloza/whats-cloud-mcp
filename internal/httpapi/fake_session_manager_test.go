@@ -3,9 +3,19 @@ package httpapi_test
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/jhonjtoloza/whats-cloud-mcp/internal/wa"
 )
+
+// What a send reports back when a test does not say otherwise.
+//
+// The timestamp is deliberately far from now: an outbound row used to be filed
+// at time.Now() instead of the moment WhatsApp recorded, and a fixed, distant
+// value is what makes the difference visible in a stored row.
+const fakeOwnJID = "573114276555@s.whatsapp.net"
+
+var fakeSentAt = time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
 
 // fakeSessionManager is the test double for wa.SessionManager. The real
 // whatsmeow-backed implementation needs a live socket, so every handler test
@@ -23,7 +33,8 @@ type fakeSessionManager struct {
 	pairErr     error
 	status      wa.SessionStatus
 	statusErr   error
-	sendID      string
+	sendResult  wa.SentMessage
+	sendResults map[string]wa.SentMessage
 	sendErr     error
 	logoutCalls []string
 	logoutErr   error
@@ -96,18 +107,38 @@ func (f *fakeSessionManager) Status(_ context.Context, tenantID string) (wa.Sess
 	return status, nil
 }
 
-func (f *fakeSessionManager) SendText(_ context.Context, tenantID, toJID, body string) (string, error) {
+// SendText stands in for the real send. Only the manager knows the address the
+// message was resolved to, the tenant's own JID and the timestamp WhatsApp
+// recorded, so here the test decides what the send would have reported — per
+// destination when it needs several, and a default otherwise.
+func (f *fakeSessionManager) SendText(_ context.Context, tenantID, toJID, body string) (wa.SentMessage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.sendCalls = append(f.sendCalls, sendCall{TenantID: tenantID, To: toJID, Body: body})
 	if f.sendErr != nil {
-		return "", f.sendErr
+		return wa.SentMessage{}, f.sendErr
 	}
-	if f.sendID != "" {
-		return f.sendID, nil
+	if sent, ok := f.sendResults[toJID]; ok {
+		return sent, nil
 	}
-	return "WA-MSG-1", nil
+
+	sent := f.sendResult
+	if sent.WAMessageID == "" {
+		sent.WAMessageID = "WA-MSG-1"
+	}
+	if sent.ChatJID == "" {
+		// The real manager canonicalises; the default here only has to be an
+		// address, so it echoes the destination.
+		sent.ChatJID = toJID
+	}
+	if sent.SenderJID == "" {
+		sent.SenderJID = fakeOwnJID
+	}
+	if sent.Timestamp.IsZero() {
+		sent.Timestamp = fakeSentAt
+	}
+	return sent, nil
 }
 
 func (f *fakeSessionManager) Logout(_ context.Context, tenantID string) error {
