@@ -263,15 +263,24 @@ func (r *messageRepo) ListChats(ctx context.Context, tenantID string, limit int)
 	// A window function picks the newest row per chat. max() with bare columns
 	// would be shorter, but an aggregate drops the column's declared type and
 	// the driver would then hand back the timestamp as a string.
+	// The name is joined inside the subquery, on the canonical address and on
+	// the tenant: a group two tenants both belong to has one row of names per
+	// tenant, and matching on the address alone would hand one tenant the name
+	// the other wrote.
+	nameJoin := ` LEFT JOIN chats
+		     ON chats.tenant_id = messages.tenant_id
+		    AND chats.chat_jid = ` + addr.chat
+
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT chat_jid, timestamp, body, direction, message_count
+		`SELECT chat_jid, chat_name, timestamp, body, direction, message_count
 		 FROM (
-		     SELECT `+addr.chat+` AS chat_jid, messages.timestamp AS timestamp,
+		     SELECT `+addr.chat+` AS chat_jid, chats.name AS chat_name,
+		            messages.timestamp AS timestamp,
 		            messages.body AS body, messages.direction AS direction,
 		            count(*) OVER (PARTITION BY `+addr.chat+`) AS message_count,
 		            row_number() OVER (PARTITION BY `+addr.chat+`
 		                               ORDER BY messages.timestamp DESC, messages.id DESC) AS row_num
-		     FROM messages`+addr.chatJoin+`
+		     FROM messages`+addr.chatJoin+nameJoin+`
 		     WHERE messages.tenant_id = ?
 		 )
 		 WHERE row_num = 1
@@ -288,10 +297,12 @@ func (r *messageRepo) ListChats(ctx context.Context, tenantID string, limit int)
 		var (
 			c         Chat
 			direction string
+			name      sql.NullString
 		)
-		if err := rows.Scan(&c.ChatJID, &c.LastMessageAt, &c.LastMessageBody, &direction, &c.MessageCount); err != nil {
+		if err := rows.Scan(&c.ChatJID, &name, &c.LastMessageAt, &c.LastMessageBody, &direction, &c.MessageCount); err != nil {
 			return nil, fmt.Errorf("store: scan chat: %w", err)
 		}
+		c.Name = name.String
 		c.LastDirection = Direction(direction)
 		out = append(out, c)
 	}

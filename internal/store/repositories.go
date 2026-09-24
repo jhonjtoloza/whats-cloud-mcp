@@ -100,3 +100,27 @@ type Messages interface {
 	// method means FTS5 can replace the implementation without touching callers.
 	Search(ctx context.Context, tenantID, query string, limit int) ([]Message, error)
 }
+
+// Chats is the display name of a conversation, cached from WhatsApp.
+//
+// It exists because a group is only addressable by a numeric JID: WhatsApp
+// keeps the subject in the group metadata, whatsmeow fetches it live and
+// persists none of it, so without this table nothing could answer "the group
+// called obd2ip". Names for people are NOT written here — the address book
+// already carries those, and duplicating them would mean two answers to the
+// same question.
+//
+// Every name is a cache of what WhatsApp owns. It is replaced wholesale on
+// every reading rather than merged, and a conversation with no row simply has
+// no name, which leaves the caller with the JID it already had.
+type Chats interface {
+	// Upsert stores the current name of one conversation, replacing whatever
+	// was there. A blank name is ignored rather than stored.
+	Upsert(ctx context.Context, tenantID string, chat NamedChat) error
+	// UpsertBatch stores many names in one transaction. It is the shape the
+	// reconnect backfill needs, which reads every joined group at once.
+	UpsertBatch(ctx context.Context, tenantID string, chats []NamedChat) error
+	// Search returns the conversations of one tenant whose name contains the
+	// query, matched case-insensitively and literally, ordered by name.
+	Search(ctx context.Context, tenantID, query string, limit int) ([]NamedChat, error)
+}

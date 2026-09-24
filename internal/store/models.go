@@ -173,9 +173,23 @@ type MediaUpdate struct {
 
 // Chat is a conversation summary derived from the messages table.
 type Chat struct {
-	ChatJID         string    `json:"chat_jid"`
+	ChatJID string `json:"chat_jid"`
+	// Name is the display name WhatsApp reports for the conversation, empty
+	// when none is known. It is omitted rather than sent blank so a caller can
+	// tell "no name" from "named the empty string" and fall back to the JID.
+	Name            string    `json:"name,omitempty"`
 	LastMessageAt   time.Time `json:"last_message_at"`
 	LastMessageBody string    `json:"last_message_body"`
 	LastDirection   Direction `json:"last_direction"`
 	MessageCount    int       `json:"message_count"`
+}
+
+// NamedChat is a conversation and the name WhatsApp shows for it.
+//
+// It is the whole content of the chats table: a group subject, cached so a
+// caller can ask for a conversation by the name it reads on its phone instead
+// of by a numeric JID it has no way of knowing.
+type NamedChat struct {
+	ChatJID string `json:"chat_jid"`
+	Name    string `json:"name"`
 }
